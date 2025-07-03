@@ -78,7 +78,7 @@ interface OnlineCombatProps {
   onBack: () => void;
 }
 
-const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, fightersDatabase, onBack }) => {
+const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, fightersDatabase = [], onBack }) => {
   const [currentView, setCurrentView] = useState<'menu' | 'matchmaking' | 'room' | 'game'>('menu');
   const [currentRoom, setCurrentRoom] = useState<GameRoom | null>(null);
   const [roomParticipants, setRoomParticipants] = useState<RoomParticipant[]>([]);
