@@ -38,34 +38,95 @@ export const useMatchmaking = (user: any) => {
     }
   };
 
-  // Recherche directe d'un match
+  // Recherche directe d'un match avec verrou pour éviter les conditions de course
   const findMatchDirect = async (gameMode: string, deckId: number, userLevel: number) => {
     try {
       // Nettoyer d'abord
       await cleanupOldQueueEntries();
 
-      // Chercher un adversaire compatible
-      const levelMin = Math.max(1, userLevel - 5);
-      const levelMax = userLevel + 5;
+      // Utiliser une transaction pour éviter les conditions de course
+      const { data: lockResult, error: lockError } = await supabase.rpc('try_create_match', {
+        p_user_id: user.id,
+        p_game_mode: gameMode,
+        p_deck_id: deckId,
+        p_user_level: userLevel,
+        p_username: user.username
+      });
 
-      const { data: potentialOpponents } = await supabase
-        .from('matchmaking_queue')
-        .select(`
-          *,
-          profile:profiles!matchmaking_queue_user_id_fkey(level, username)
-        `)
-        .eq('status', 'searching')
-        .eq('game_mode', gameMode)
-        .neq('user_id', user.id)
-        .gte('preferred_level_min', levelMin)
-        .lte('preferred_level_max', levelMax)
-        .order('created_at', { ascending: true })
-        .limit(1);
+      if (lockError) {
+        console.error('Erreur RPC try_create_match:', lockError);
+        // Fallback vers l'ancienne méthode
+        return await findMatchFallback(gameMode, deckId, userLevel);
+      }
 
-      if (potentialOpponents && potentialOpponents.length > 0) {
-        // Match trouvé ! Créer une salle de jeu
-        const opponent = potentialOpponents[0];
+      if (lockResult && lockResult.length > 0) {
+        const result = lockResult[0];
         
+        if (result.status === 'match_found') {
+          return {
+            status: 'match_found',
+            room_id: result.room_id,
+            opponent: {
+              username: result.opponent_username,
+              level: result.opponent_level
+            }
+          };
+        } else if (result.status === 'searching') {
+          return {
+            status: 'searching',
+            queue_id: result.queue_id
+          };
+        }
+      }
+
+      // Fallback si la RPC ne retourne rien
+      return await findMatchFallback(gameMode, deckId, userLevel);
+
+    } catch (error) {
+      console.error('Erreur find_match:', error);
+      // Fallback vers l'ancienne méthode
+      return await findMatchFallback(gameMode, deckId, userLevel);
+    }
+  };
+
+  // Méthode de fallback (ancienne logique)
+  const findMatchFallback = async (gameMode: string, deckId: number, userLevel: number) => {
+    const levelMin = Math.max(1, userLevel - 5);
+    const levelMax = userLevel + 5;
+
+    // Chercher un adversaire compatible
+    const { data: potentialOpponents } = await supabase
+      .from('matchmaking_queue')
+      .select(`
+        *,
+        profile:profiles!matchmaking_queue_user_id_fkey(level, username)
+      `)
+      .eq('status', 'searching')
+      .eq('game_mode', gameMode)
+      .neq('user_id', user.id)
+      .gte('preferred_level_min', levelMin)
+      .lte('preferred_level_max', levelMax)
+      .order('created_at', { ascending: true })
+      .limit(1);
+
+    if (potentialOpponents && potentialOpponents.length > 0) {
+      // Match trouvé ! Essayer de créer une salle
+      const opponent = potentialOpponents[0];
+      
+      try {
+        // Vérifier que l'adversaire est toujours disponible
+        const { data: stillAvailable } = await supabase
+          .from('matchmaking_queue')
+          .select('id')
+          .eq('id', opponent.id)
+          .eq('status', 'searching')
+          .single();
+
+        if (!stillAvailable) {
+          // L'adversaire n'est plus disponible, ajouter à la file
+          return await addToQueue(gameMode, deckId, userLevel);
+        }
+
         // Créer la salle
         const { data: room, error: roomError } = await supabase
           .from('game_rooms')
@@ -126,58 +187,67 @@ export const useMatchmaking = (user: any) => {
             level: opponent.profile.level
           }
         };
-      } else {
-        // Aucun adversaire trouvé, ajouter à la file d'attente
-        const { data: queueEntry, error: queueError } = await supabase
+      } catch (error) {
+        console.error('Erreur création salle:', error);
+        // En cas d'erreur, ajouter à la file
+        return await addToQueue(gameMode, deckId, userLevel);
+      }
+    } else {
+      // Aucun adversaire trouvé, ajouter à la file d'attente
+      return await addToQueue(gameMode, deckId, userLevel);
+    }
+  };
+
+  // Ajouter à la file d'attente
+  const addToQueue = async (gameMode: string, deckId: number, userLevel: number) => {
+    const levelMin = Math.max(1, userLevel - 5);
+    const levelMax = userLevel + 5;
+
+    const { data: queueEntry, error: queueError } = await supabase
+      .from('matchmaking_queue')
+      .insert({
+        user_id: user.id,
+        game_mode: gameMode,
+        deck_id: deckId,
+        preferred_level_min: levelMin,
+        preferred_level_max: levelMax,
+        status: 'searching'
+      })
+      .select()
+      .single();
+
+    if (queueError) {
+      if (queueError.code === '23505') {
+        // Entrée existante, la mettre à jour
+        const { data: updatedEntry, error: updateError } = await supabase
           .from('matchmaking_queue')
-          .insert({
-            user_id: user.id,
+          .update({
             game_mode: gameMode,
             deck_id: deckId,
             preferred_level_min: levelMin,
             preferred_level_max: levelMax,
-            status: 'searching'
+            status: 'searching',
+            created_at: new Date().toISOString(),
+            matched_at: null
           })
+          .eq('user_id', user.id)
           .select()
           .single();
 
-        if (queueError) {
-          if (queueError.code === '23505') {
-            // Entrée existante, la mettre à jour
-            const { data: updatedEntry, error: updateError } = await supabase
-              .from('matchmaking_queue')
-              .update({
-                game_mode: gameMode,
-                deck_id: deckId,
-                preferred_level_min: levelMin,
-                preferred_level_max: levelMax,
-                status: 'searching',
-                created_at: new Date().toISOString(),
-                matched_at: null
-              })
-              .eq('user_id', user.id)
-              .select()
-              .single();
-
-            if (updateError) throw updateError;
-            
-            return { 
-              status: 'searching', 
-              queue_id: updatedEntry.id
-            };
-          }
-          throw queueError;
-        }
-
+        if (updateError) throw updateError;
+        
         return { 
           status: 'searching', 
-          queue_id: queueEntry.id
+          queue_id: updatedEntry.id
         };
       }
-    } catch (error) {
-      console.error('Erreur find_match:', error);
-      throw error;
+      throw queueError;
     }
+
+    return { 
+      status: 'searching', 
+      queue_id: queueEntry.id
+    };
   };
 
   // Démarrer la recherche
@@ -243,31 +313,37 @@ export const useMatchmaking = (user: any) => {
           
           console.log('Adversaire potentiel trouvé:', newEntry);
           
-          // Essayer de créer un match
-          try {
-            const result = await findMatchDirect(gameMode, deckId, userLevel);
-            if (result.status === 'match_found') {
-              setState(prev => ({
-                ...prev,
-                status: 'match_found',
-                roomId: result.room_id,
-                opponent: result.opponent,
-                isSearching: false
-              }));
-              
-              // Arrêter l'écoute
-              newSubscription.unsubscribe();
+          // Attendre un peu pour éviter les conditions de course
+          setTimeout(async () => {
+            try {
+              const result = await findMatchDirect(gameMode, deckId, userLevel);
+              if (result.status === 'match_found') {
+                setState(prev => ({
+                  ...prev,
+                  status: 'match_found',
+                  roomId: result.room_id,
+                  opponent: result.opponent,
+                  isSearching: false
+                }));
+                
+                // Arrêter l'écoute
+                newSubscription.unsubscribe();
+                if (pollInterval) {
+                  clearInterval(pollInterval);
+                  setPollInterval(null);
+                }
+              }
+            } catch (error) {
+              console.error('Erreur création match automatique:', error);
             }
-          } catch (error) {
-            console.error('Erreur création match automatique:', error);
-          }
+          }, Math.random() * 1000 + 500); // Délai aléatoire entre 500ms et 1.5s
         }
       })
       .subscribe();
 
     setSubscription(newSubscription);
 
-    // Démarrer aussi un polling de sécurité
+    // Démarrer aussi un polling de sécurité moins fréquent
     const interval = setInterval(async () => {
       try {
         const result = await findMatchDirect(gameMode, deckId, userLevel);
@@ -286,7 +362,7 @@ export const useMatchmaking = (user: any) => {
       } catch (error) {
         console.error('Erreur polling:', error);
       }
-    }, 5000); // Vérifier toutes les 5 secondes
+    }, 10000); // Vérifier toutes les 10 secondes
 
     setPollInterval(interval);
   };
