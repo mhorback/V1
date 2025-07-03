@@ -38,163 +38,120 @@ export const useMatchmaking = (user: any) => {
     }
   };
 
-  // Recherche directe d'un match avec verrou pour éviter les conditions de course
+  // Recherche directe d'un match
   const findMatchDirect = async (gameMode: string, deckId: number, userLevel: number) => {
     try {
       // Nettoyer d'abord
       await cleanupOldQueueEntries();
 
-      // Utiliser une transaction pour éviter les conditions de course
-      const { data: lockResult, error: lockError } = await supabase.rpc('try_create_match', {
-        p_user_id: user.id,
-        p_game_mode: gameMode,
-        p_deck_id: deckId,
-        p_user_level: userLevel,
-        p_username: user.username
-      });
+      const levelMin = Math.max(1, userLevel - 5);
+      const levelMax = userLevel + 5;
 
-      if (lockError) {
-        console.error('Erreur RPC try_create_match:', lockError);
-        // Fallback vers l'ancienne méthode
-        return await findMatchFallback(gameMode, deckId, userLevel);
-      }
+      // Chercher un adversaire compatible
+      const { data: potentialOpponents } = await supabase
+        .from('matchmaking_queue')
+        .select(`
+          *,
+          profile:profiles!matchmaking_queue_user_id_fkey(level, username)
+        `)
+        .eq('status', 'searching')
+        .eq('game_mode', gameMode)
+        .neq('user_id', user.id)
+        .gte('preferred_level_min', levelMin)
+        .lte('preferred_level_max', levelMax)
+        .order('created_at', { ascending: true })
+        .limit(1);
 
-      if (lockResult && lockResult.length > 0) {
-        const result = lockResult[0];
+      if (potentialOpponents && potentialOpponents.length > 0) {
+        // Match trouvé ! Essayer de créer une salle
+        const opponent = potentialOpponents[0];
         
-        if (result.status === 'match_found') {
-          return {
-            status: 'match_found',
-            room_id: result.room_id,
+        try {
+          // Vérifier que l'adversaire est toujours disponible
+          const { data: stillAvailable } = await supabase
+            .from('matchmaking_queue')
+            .select('id')
+            .eq('id', opponent.id)
+            .eq('status', 'searching')
+            .single();
+
+          if (!stillAvailable) {
+            // L'adversaire n'est plus disponible, ajouter à la file
+            return await addToQueue(gameMode, deckId, userLevel);
+          }
+
+          // Créer la salle
+          const { data: room, error: roomError } = await supabase
+            .from('game_rooms')
+            .insert({
+              name: `Match ${gameMode}`,
+              host_id: user.id,
+              game_mode: gameMode,
+              status: 'waiting',
+              max_players: 2,
+              current_players: 2,
+              allow_spectators: true,
+              min_level: Math.min(userLevel, opponent.profile.level),
+              max_level: Math.max(userLevel, opponent.profile.level)
+            })
+            .select()
+            .single();
+
+          if (roomError) throw roomError;
+
+          // Ajouter les deux joueurs à la salle
+          const { error: participant1Error } = await supabase
+            .from('room_participants')
+            .insert({
+              room_id: room.id,
+              user_id: user.id,
+              role: 'player',
+              player_number: 1,
+              deck_id: deckId,
+              status: 'connected'
+            });
+
+          if (participant1Error) throw participant1Error;
+
+          const { error: participant2Error } = await supabase
+            .from('room_participants')
+            .insert({
+              room_id: room.id,
+              user_id: opponent.user_id,
+              role: 'player',
+              player_number: 2,
+              deck_id: opponent.deck_id,
+              status: 'connected'
+            });
+
+          if (participant2Error) throw participant2Error;
+
+          // Supprimer les entrées de file d'attente
+          await supabase
+            .from('matchmaking_queue')
+            .delete()
+            .in('user_id', [user.id, opponent.user_id]);
+
+          return { 
+            status: 'match_found', 
+            room_id: room.id,
             opponent: {
-              username: result.opponent_username,
-              level: result.opponent_level
+              username: opponent.profile.username,
+              level: opponent.profile.level
             }
           };
-        } else if (result.status === 'searching') {
-          return {
-            status: 'searching',
-            queue_id: result.queue_id
-          };
-        }
-      }
-
-      // Fallback si la RPC ne retourne rien
-      return await findMatchFallback(gameMode, deckId, userLevel);
-
-    } catch (error) {
-      console.error('Erreur find_match:', error);
-      // Fallback vers l'ancienne méthode
-      return await findMatchFallback(gameMode, deckId, userLevel);
-    }
-  };
-
-  // Méthode de fallback (ancienne logique)
-  const findMatchFallback = async (gameMode: string, deckId: number, userLevel: number) => {
-    const levelMin = Math.max(1, userLevel - 5);
-    const levelMax = userLevel + 5;
-
-    // Chercher un adversaire compatible
-    const { data: potentialOpponents } = await supabase
-      .from('matchmaking_queue')
-      .select(`
-        *,
-        profile:profiles!matchmaking_queue_user_id_fkey(level, username)
-      `)
-      .eq('status', 'searching')
-      .eq('game_mode', gameMode)
-      .neq('user_id', user.id)
-      .gte('preferred_level_min', levelMin)
-      .lte('preferred_level_max', levelMax)
-      .order('created_at', { ascending: true })
-      .limit(1);
-
-    if (potentialOpponents && potentialOpponents.length > 0) {
-      // Match trouvé ! Essayer de créer une salle
-      const opponent = potentialOpponents[0];
-      
-      try {
-        // Vérifier que l'adversaire est toujours disponible
-        const { data: stillAvailable } = await supabase
-          .from('matchmaking_queue')
-          .select('id')
-          .eq('id', opponent.id)
-          .eq('status', 'searching')
-          .single();
-
-        if (!stillAvailable) {
-          // L'adversaire n'est plus disponible, ajouter à la file
+        } catch (error) {
+          console.error('Erreur création salle:', error);
+          // En cas d'erreur, ajouter à la file
           return await addToQueue(gameMode, deckId, userLevel);
         }
-
-        // Créer la salle
-        const { data: room, error: roomError } = await supabase
-          .from('game_rooms')
-          .insert({
-            name: `Match ${gameMode}`,
-            host_id: user.id,
-            game_mode: gameMode,
-            status: 'waiting',
-            max_players: 2,
-            current_players: 2,
-            allow_spectators: true,
-            min_level: Math.min(userLevel, opponent.profile.level),
-            max_level: Math.max(userLevel, opponent.profile.level)
-          })
-          .select()
-          .single();
-
-        if (roomError) throw roomError;
-
-        // Ajouter les deux joueurs à la salle
-        const { error: participant1Error } = await supabase
-          .from('room_participants')
-          .insert({
-            room_id: room.id,
-            user_id: user.id,
-            role: 'player',
-            player_number: 1,
-            deck_id: deckId,
-            status: 'connected'
-          });
-
-        if (participant1Error) throw participant1Error;
-
-        const { error: participant2Error } = await supabase
-          .from('room_participants')
-          .insert({
-            room_id: room.id,
-            user_id: opponent.user_id,
-            role: 'player',
-            player_number: 2,
-            deck_id: opponent.deck_id,
-            status: 'connected'
-          });
-
-        if (participant2Error) throw participant2Error;
-
-        // Supprimer les entrées de file d'attente
-        await supabase
-          .from('matchmaking_queue')
-          .delete()
-          .in('user_id', [user.id, opponent.user_id]);
-
-        return { 
-          status: 'match_found', 
-          room_id: room.id,
-          opponent: {
-            username: opponent.profile.username,
-            level: opponent.profile.level
-          }
-        };
-      } catch (error) {
-        console.error('Erreur création salle:', error);
-        // En cas d'erreur, ajouter à la file
+      } else {
+        // Aucun adversaire trouvé, ajouter à la file d'attente
         return await addToQueue(gameMode, deckId, userLevel);
       }
-    } else {
-      // Aucun adversaire trouvé, ajouter à la file d'attente
-      return await addToQueue(gameMode, deckId, userLevel);
+    } catch (error) {
+      console.error('Erreur find_match:', error);
+      throw error;
     }
   };
 
@@ -362,7 +319,7 @@ export const useMatchmaking = (user: any) => {
       } catch (error) {
         console.error('Erreur polling:', error);
       }
-    }, 10000); // Vérifier toutes les 10 secondes
+    }, 5000); // Vérifier toutes les 5 secondes
 
     setPollInterval(interval);
   };

@@ -41,7 +41,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
     }
   };
 
-  // Charger les participants d'une salle
+  // Charger les participants d'une salle avec gestion d'erreur
   const loadRoomParticipants = useCallback(async (roomId: string) => {
     try {
       const { data, error } = await supabase
@@ -52,8 +52,28 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
         `)
         .eq('room_id', roomId);
 
-      if (error) throw error;
-      setRoomParticipants(data || []);
+      if (error) {
+        console.error('Erreur chargement participants:', error);
+        return;
+      }
+
+      // Filtrer les participants avec des profils valides
+      const validParticipants = (data || []).map(participant => {
+        if (!participant.profile) {
+          // Si le profil n'est pas chargé, essayer de le récupérer directement
+          console.warn('Profil manquant pour participant:', participant.user_id);
+          return {
+            ...participant,
+            profile: {
+              username: 'Utilisateur inconnu',
+              level: 1
+            }
+          };
+        }
+        return participant;
+      });
+
+      setRoomParticipants(validParticipants);
     } catch (err) {
       console.error('Erreur participants:', err);
     }
@@ -153,15 +173,28 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
   // Gérer les résultats du matchmaking
   useEffect(() => {
     if (matchmaking.status === 'match_found' && matchmaking.roomId) {
+      console.log('Match trouvé, redirection vers la salle:', matchmaking.roomId);
+      
+      // Arrêter le matchmaking
+      matchmaking.cancelSearch();
+      
       // Rediriger vers la salle trouvée
       setCurrentView('room');
+      
       // Charger les détails de la salle
       supabase
         .from('game_rooms')
         .select('*')
         .eq('id', matchmaking.roomId)
         .single()
-        .then(({ data }) => {
+        .then(({ data, error }) => {
+          if (error) {
+            console.error('Erreur chargement salle:', error);
+            setError('Impossible de charger la salle');
+            setCurrentView('menu');
+            return;
+          }
+          
           if (data) {
             setCurrentRoom(data);
             setIsReady(false);
@@ -174,6 +207,13 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
   useEffect(() => {
     if (currentRoom && currentView === 'room') {
       loadRoomParticipants(currentRoom.id);
+      
+      // Recharger périodiquement pour s'assurer d'avoir les dernières données
+      const interval = setInterval(() => {
+        loadRoomParticipants(currentRoom.id);
+      }, 2000);
+      
+      return () => clearInterval(interval);
     }
   }, [currentRoom, currentView, loadRoomParticipants]);
 
@@ -190,6 +230,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
         table: 'room_participants',
         filter: `room_id=eq.${currentRoom.id}`
       }, () => {
+        console.log('Changement de participants détecté');
         loadRoomParticipants(currentRoom.id);
       })
       .subscribe();
@@ -203,6 +244,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
         table: 'game_rooms',
         filter: `id=eq.${currentRoom.id}`
       }, (payload) => {
+        console.log('Changement de salle détecté:', payload);
         const updatedRoom = payload.new;
         setCurrentRoom(updatedRoom);
         
@@ -455,7 +497,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
                           )}
                           <div>
                             <p className="text-white font-bold">
-                              {player.profile?.username || 'Utilisateur inconnu'}
+                              {player.profile?.username || 'Chargement...'}
                             </p>
                             <p className="text-gray-300 text-sm">
                               Niveau {player.profile?.level || 'N/A'}
