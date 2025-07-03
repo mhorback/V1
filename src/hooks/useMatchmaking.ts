@@ -11,6 +11,7 @@ interface MatchmakingState {
     level: number;
   };
   error?: string;
+  selectedDeckId?: number;
 }
 
 export const useMatchmaking = (user: any) => {
@@ -187,7 +188,8 @@ export const useMatchmaking = (user: any) => {
         isSearching: true, 
         status: 'searching', 
         error: undefined, 
-        queueTime: 0 
+        queueTime: 0,
+        selectedDeckId: deckId
       }));
 
       const result = await findMatchDirect(gameMode, deckId, userLevel);
@@ -202,7 +204,7 @@ export const useMatchmaking = (user: any) => {
         }));
       } else if (result.status === 'searching') {
         // Démarrer l'écoute en temps réel pour les nouveaux adversaires
-        startRealtimeListening(gameMode, userLevel);
+        startRealtimeListening(gameMode, deckId, userLevel);
       }
     } catch (error) {
       console.error('Erreur démarrage recherche:', error);
@@ -216,7 +218,7 @@ export const useMatchmaking = (user: any) => {
   }, [user.id]);
 
   // Écoute en temps réel pour les nouveaux adversaires
-  const startRealtimeListening = (gameMode: string, userLevel: number) => {
+  const startRealtimeListening = (gameMode: string, deckId: number, userLevel: number) => {
     // Arrêter l'ancienne subscription
     if (subscription) {
       subscription.unsubscribe();
@@ -243,7 +245,7 @@ export const useMatchmaking = (user: any) => {
           
           // Essayer de créer un match
           try {
-            const result = await findMatchDirect(gameMode, state.queueTime, userLevel);
+            const result = await findMatchDirect(gameMode, deckId, userLevel);
             if (result.status === 'match_found') {
               setState(prev => ({
                 ...prev,
@@ -268,7 +270,7 @@ export const useMatchmaking = (user: any) => {
     // Démarrer aussi un polling de sécurité
     const interval = setInterval(async () => {
       try {
-        const result = await findMatchDirect(gameMode, state.queueTime, userLevel);
+        const result = await findMatchDirect(gameMode, deckId, userLevel);
         if (result.status === 'match_found') {
           setState(prev => ({
             ...prev,
