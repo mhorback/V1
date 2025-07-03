@@ -1,52 +1,47 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
-import { useAuth } from '../contexts/AuthContext';
-import { Swords, Users, Clock, Trophy, ArrowLeft, Play, UserCheck, UserX } from 'lucide-react';
-
-interface Room {
-  id: string;
-  name: string;
-  host_id: string;
-  max_players: number;
-  is_public: boolean;
-  status: 'waiting' | 'playing' | 'finished';
-  created_at: string;
-  settings: {
-    time_limit: number;
-    rounds: number;
-  };
-}
-
-interface RoomParticipant {
-  id: string;
-  user_id: string;
-  room_id: string;
-  role: 'player' | 'spectator';
-  status: 'waiting' | 'ready' | 'playing';
-  joined_at: string;
-  profile: {
-    username: string;
-    level: number;
-  };
-}
+import { useMatchmaking } from '../hooks/useMatchmaking';
+import { Wifi, WifiOff, AlertCircle, Clock, Check, Users } from 'lucide-react';
+import GameBoard from './GameBoard';
 
 interface OnlineCombatProps {
+  user: any;
+  userDecks: any[];
   onBack: () => void;
 }
 
-const OnlineCombat: React.FC<OnlineCombatProps> = ({ onBack }) => {
-  const { user } = useAuth();
-  const [currentView, setCurrentView] = useState<'lobby' | 'room' | 'game'>('lobby');
-  const [rooms, setRooms] = useState<Room[]>([]);
-  const [currentRoom, setCurrentRoom] = useState<Room | null>(null);
-  const [roomParticipants, setRoomParticipants] = useState<RoomParticipant[]>([]);
-  const [isHost, setIsHost] = useState(false);
-  const [isReady, setIsReady] = useState(false);
-  const [showCreateRoom, setShowCreateRoom] = useState(false);
-  const [newRoomName, setNewRoomName] = useState('');
+const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) => {
+  const [currentView, setCurrentView] = useState<'menu' | 'matchmaking' | 'room' | 'game'>('menu');
+  const [currentRoom, setCurrentRoom] = useState<any>(null);
+  const [roomParticipants, setRoomParticipants] = useState<any[]>([]);
+  const [isConnected, setIsConnected] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedDeck, setSelectedDeck] = useState<any>(null);
+  const [isReady, setIsReady] = useState(false);
+  const [gameStartCountdown, setGameStartCountdown] = useState(0);
 
-  // ✅ CORRECTION : Fonction loadRoomParticipants améliorée
+  // Hook de matchmaking
+  const matchmaking = useMatchmaking(user);
+
+  // Entrer en file d'attente
+  const enterMatchmaking = async () => {
+    if (!selectedDeck) {
+      setError('Veuillez sélectionner un deck');
+      return;
+    }
+
+    try {
+      setCurrentView('matchmaking');
+      await matchmaking.startSearch('casual', selectedDeck.id, user.level);
+    } catch (err) {
+      console.error('Erreur matchmaking:', err);
+      setError('Impossible de démarrer la recherche');
+      setCurrentView('menu');
+    }
+  };
+
+  // Charger les participants d'une salle avec gestion d'erreur
   const loadRoomParticipants = useCallback(async (roomId: string) => {
     try {
       const { data, error } = await supabase
@@ -62,425 +57,320 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ onBack }) => {
         return;
       }
 
-      // ✅ CORRECTION : Filtrer les participants invalides complètement
-      const validParticipants = (data || []).filter(participant => {
-        if (!participant.profile || !participant.profile.username) {
-          console.warn('Participant avec profil invalide ignoré:', participant.user_id);
-          return false;
+      // Filtrer les participants avec des profils valides
+      const validParticipants = (data || []).map(participant => {
+        if (!participant.profile) {
+          // Si le profil n'est pas chargé, essayer de le récupérer directement
+          console.warn('Profil manquant pour participant:', participant.user_id);
+          return {
+            ...participant,
+            profile: {
+              username: 'Utilisateur inconnu',
+              level: 1
+            }
+          };
         }
-        return true;
+        return participant;
       });
 
       setRoomParticipants(validParticipants);
-      
-      // Mettre à jour le statut prêt de l'utilisateur actuel
-      const currentUserParticipant = validParticipants.find(p => p.user_id === user.id);
-      if (currentUserParticipant) {
-        setIsReady(currentUserParticipant.status === 'ready');
-      }
     } catch (err) {
       console.error('Erreur participants:', err);
     }
-  }, [user.id]);
-
-  // ✅ CORRECTION : Fonction de nettoyage automatique
-  const cleanupInvalidParticipants = useCallback(async (roomId: string) => {
-    try {
-      // Supprimer les participants sans profil valide
-      const { error } = await supabase
-        .from('room_participants')
-        .delete()
-        .eq('room_id', roomId)
-        .is('profile.username', null);
-
-      if (error) {
-        console.error('Erreur nettoyage participants:', error);
-      }
-    } catch (err) {
-      console.error('Erreur nettoyage:', err);
-    }
   }, []);
 
-  const loadRooms = useCallback(async () => {
-    try {
-      const { data, error } = await supabase
-        .from('rooms')
-        .select('*')
-        .eq('status', 'waiting')
-        .eq('is_public', true)
-        .order('created_at', { ascending: false });
+  // Formatage du temps
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
 
-      if (error) {
-        console.error('Erreur chargement salles:', error);
-        return;
-      }
-
-      setRooms(data || []);
-    } catch (err) {
-      console.error('Erreur salles:', err);
-    }
-  }, []);
-
-  const createRoom = async () => {
-    if (!newRoomName.trim()) return;
+  // Démarrer le jeu
+  const startGame = async () => {
+    if (!currentRoom) return;
 
     setLoading(true);
     try {
-      const { data: roomData, error: roomError } = await supabase
-        .from('rooms')
-        .insert([
-          {
-            name: newRoomName.trim(),
-            host_id: user.id,
-            max_players: 2,
-            is_public: true,
-            status: 'waiting',
-            settings: {
-              time_limit: 300,
-              rounds: 1
-            }
+      // Démarrer le compte à rebours
+      setGameStartCountdown(5);
+      
+      const countdown = setInterval(() => {
+        setGameStartCountdown(prev => {
+          if (prev <= 1) {
+            clearInterval(countdown);
+            // Démarrer réellement le jeu
+            actuallyStartGame();
+            return 0;
           }
-        ])
-        .select()
-        .single();
+          return prev - 1;
+        });
+      }, 1000);
 
-      if (roomError) {
-        console.error('Erreur création salle:', roomError);
-        return;
-      }
-
-      // Rejoindre la salle en tant qu'hôte
-      const { error: participantError } = await supabase
-        .from('room_participants')
-        .insert([
-          {
-            user_id: user.id,
-            room_id: roomData.id,
-            role: 'player',
-            status: 'waiting'
-          }
-        ]);
-
-      if (participantError) {
-        console.error('Erreur rejoindre salle:', participantError);
-        return;
-      }
-
-      setCurrentRoom(roomData);
-      setIsHost(true);
-      setCurrentView('room');
-      setShowCreateRoom(false);
-      setNewRoomName('');
     } catch (err) {
-      console.error('Erreur création:', err);
+      console.error('Erreur démarrage jeu:', err);
+      setError('Impossible de démarrer le jeu');
+      setLoading(false);
+    }
+  };
+
+  const actuallyStartGame = async () => {
+    if (!currentRoom) return;
+
+    try {
+      // Mettre à jour le statut de la salle
+      const { error: roomError } = await supabase
+        .from('game_rooms')
+        .update({ 
+          status: 'in_progress',
+          started_at: new Date().toISOString()
+        })
+        .eq('id', currentRoom.id);
+
+      if (roomError) throw roomError;
+
+      // Mettre à jour le statut des participants
+      const { error: participantsError } = await supabase
+        .from('room_participants')
+        .update({ status: 'playing' })
+        .eq('room_id', currentRoom.id)
+        .eq('role', 'player');
+
+      if (participantsError) throw participantsError;
+
+      // Passer à l'interface de jeu
+      setCurrentView('game');
+    } catch (err) {
+      console.error('Erreur démarrage réel du jeu:', err);
+      setError('Impossible de démarrer le jeu');
     } finally {
       setLoading(false);
     }
   };
 
-  const joinRoom = async (room: Room) => {
-    setLoading(true);
-    try {
-      const { error } = await supabase
-        .from('room_participants')
-        .insert([
-          {
-            user_id: user.id,
-            room_id: room.id,
-            role: 'player',
-            status: 'waiting'
-          }
-        ]);
-
-      if (error) {
-        console.error('Erreur rejoindre salle:', error);
-        return;
-      }
-
-      setCurrentRoom(room);
-      setIsHost(false);
-      setCurrentView('room');
-    } catch (err) {
-      console.error('Erreur rejoindre:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // Basculer le statut prêt
   const toggleReady = async () => {
     if (!currentRoom) return;
 
-    const newStatus = isReady ? 'waiting' : 'ready';
-    
     try {
+      const newStatus = isReady ? 'connected' : 'ready';
+      
       const { error } = await supabase
         .from('room_participants')
         .update({ status: newStatus })
         .eq('room_id', currentRoom.id)
         .eq('user_id', user.id);
 
-      if (error) {
-        console.error('Erreur changement statut:', error);
-        return;
-      }
-
+      if (error) throw error;
+      
       setIsReady(!isReady);
     } catch (err) {
-      console.error('Erreur statut:', err);
+      console.error('Erreur changement statut:', err);
+      setError('Impossible de changer le statut');
     }
   };
 
-  const leaveRoom = async () => {
-    if (!currentRoom) return;
-
-    try {
-      const { error } = await supabase
-        .from('room_participants')
-        .delete()
-        .eq('room_id', currentRoom.id)
-        .eq('user_id', user.id);
-
-      if (error) {
-        console.error('Erreur quitter salle:', error);
-        return;
-      }
-
-      if (isHost) {
-        // Si c'est l'hôte, supprimer la salle
-        await supabase
-          .from('rooms')
-          .delete()
-          .eq('id', currentRoom.id);
-      }
-
-      setCurrentRoom(null);
-      setIsHost(false);
-      setIsReady(false);
-      setCurrentView('lobby');
-    } catch (err) {
-      console.error('Erreur quitter:', err);
+  // Gérer les résultats du matchmaking
+  useEffect(() => {
+    if (matchmaking.status === 'match_found' && matchmaking.roomId) {
+      console.log('Match trouvé, redirection vers la salle:', matchmaking.roomId);
+      
+      // Arrêter le matchmaking
+      matchmaking.cancelSearch();
+      
+      // Rediriger vers la salle trouvée
+      setCurrentView('room');
+      
+      // Charger les détails de la salle
+      supabase
+        .from('game_rooms')
+        .select('*')
+        .eq('id', matchmaking.roomId)
+        .single()
+        .then(({ data, error }) => {
+          if (error) {
+            console.error('Erreur chargement salle:', error);
+            setError('Impossible de charger la salle');
+            setCurrentView('menu');
+            return;
+          }
+          
+          if (data) {
+            setCurrentRoom(data);
+            setIsReady(false);
+          }
+        });
     }
-  };
+  }, [matchmaking.status, matchmaking.roomId]);
 
-  const startGame = async () => {
-    if (!currentRoom || !isHost) return;
-
-    try {
-      const { error } = await supabase
-        .from('rooms')
-        .update({ status: 'playing' })
-        .eq('id', currentRoom.id);
-
-      if (error) {
-        console.error('Erreur démarrage:', error);
-        return;
-      }
-
-      setCurrentView('game');
-    } catch (err) {
-      console.error('Erreur démarrage:', err);
-    }
-  };
-
-  // ✅ CORRECTION : useEffect amélioré avec nettoyage
+  // Charger les participants quand on entre dans une salle
   useEffect(() => {
     if (currentRoom && currentView === 'room') {
       loadRoomParticipants(currentRoom.id);
-      cleanupInvalidParticipants(currentRoom.id);
       
+      // Recharger périodiquement pour s'assurer d'avoir les dernières données
       const interval = setInterval(() => {
         loadRoomParticipants(currentRoom.id);
-      }, 3000);
+      }, 2000);
       
       return () => clearInterval(interval);
     }
-  }, [currentRoom, currentView, loadRoomParticipants, cleanupInvalidParticipants]);
+  }, [currentRoom, currentView, loadRoomParticipants]);
 
+  // Subscriptions temps réel
   useEffect(() => {
-    if (currentView === 'lobby') {
-      loadRooms();
-      const interval = setInterval(loadRooms, 5000);
-      return () => clearInterval(interval);
-    }
-  }, [currentView, loadRooms]);
+    if (!currentRoom) return;
 
-  // ✅ CORRECTION : Logique de démarrage améliorée
-  const players = roomParticipants.filter(p => 
-    p.role === 'player' && 
-    p.profile && 
-    p.profile.username && 
-    p.profile.username !== 'Utilisateur inconnu'
-  );
-  const readyPlayers = players.filter(p => p.status === 'ready');
-  const canStart = players.length === 2 && readyPlayers.length === 2 && isHost;
+    // Écouter les changements de participants
+    const participantsSubscription = supabase
+      .channel(`room_participants_${currentRoom.id}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'room_participants',
+        filter: `room_id=eq.${currentRoom.id}`
+      }, () => {
+        console.log('Changement de participants détecté');
+        loadRoomParticipants(currentRoom.id);
+      })
+      .subscribe();
 
-  // Debug pour identifier le problème
-  console.log('Debug participants:', {
-    totalParticipants: roomParticipants.length,
-    validPlayers: players.length,
-    readyPlayers: readyPlayers.length,
-    isHost,
-    canStart,
-    participants: roomParticipants.map(p => ({
-      user_id: p.user_id,
-      username: p.profile?.username,
-      status: p.status,
-      role: p.role
-    }))
-  });
+    // Écouter les changements de salle
+    const roomSubscription = supabase
+      .channel(`room_${currentRoom.id}`)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'game_rooms',
+        filter: `id=eq.${currentRoom.id}`
+      }, (payload) => {
+        console.log('Changement de salle détecté:', payload);
+        const updatedRoom = payload.new;
+        setCurrentRoom(updatedRoom);
+        
+        // Si le jeu a commencé, passer à l'interface de jeu
+        if (updatedRoom.status === 'in_progress') {
+          setCurrentView('game');
+        }
+      })
+      .subscribe();
 
-  if (currentView === 'game') {
+    return () => {
+      participantsSubscription.unsubscribe();
+      roomSubscription.unsubscribe();
+    };
+  }, [currentRoom, loadRoomParticipants]);
+
+  // Gérer la fin de partie
+  const handleGameEnd = (winner: string) => {
+    alert(`${winner} a gagné la partie !`);
+    setCurrentView('menu');
+    setCurrentRoom(null);
+    setIsReady(false);
+    setGameStartCountdown(0);
+  };
+
+  // Interface de jeu
+  if (currentView === 'game' && currentRoom) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white p-4">
-        <div className="max-w-4xl mx-auto">
-          <div className="text-center py-20">
-            <h1 className="text-4xl font-bold mb-8">Combat en Cours</h1>
-            <p className="text-xl text-gray-300">Implémentation du combat multijoueur à venir...</p>
-            <button
-              onClick={() => setCurrentView('room')}
-              className="mt-8 bg-red-600 hover:bg-red-700 px-6 py-3 rounded-lg font-semibold transition-colors"
-            >
-              Retour à la Salle
-            </button>
-          </div>
-        </div>
-      </div>
+      <GameBoard
+        roomId={currentRoom.id}
+        playerId={user.id}
+        onGameEnd={handleGameEnd}
+        onBack={() => setCurrentView('room')}
+      />
     );
   }
 
-  if (currentView === 'room' && currentRoom) {
+  // Interface principale
+  if (currentView === 'menu') {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white p-4">
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 p-4">
         <div className="max-w-4xl mx-auto">
-          <div className="flex items-center justify-between mb-8">
-            <button
-              onClick={leaveRoom}
-              className="flex items-center space-x-2 text-gray-300 hover:text-white transition-colors"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span>Quitter la Salle</span>
-            </button>
-            <h1 className="text-3xl font-bold">{currentRoom.name}</h1>
-            <div className="w-32"></div>
+          <div className="flex justify-between items-center mb-8">
+            <h1 className="text-4xl font-bold text-white">⚔️ Combat en Ligne</h1>
+            <div className="flex items-center gap-4">
+              <div className={`flex items-center gap-2 px-3 py-2 rounded-lg ${isConnected ? 'bg-green-900' : 'bg-red-900'}`}>
+                {isConnected ? <Wifi className="w-4 h-4 text-green-400" /> : <WifiOff className="w-4 h-4 text-red-400" />}
+                <span className="text-white text-sm">{isConnected ? 'Connecté' : 'Déconnecté'}</span>
+              </div>
+              <button
+                onClick={onBack}
+                className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg font-bold transition-colors"
+              >
+                🏠 Retour
+              </button>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            {/* Participants */}
-            <div className="lg:col-span-2">
-              <div className="bg-gray-800 rounded-lg p-6">
-                <h2 className="text-2xl font-bold mb-4 flex items-center">
-                  <Users className="w-6 h-6 mr-2" />
-                  Participants ({players.length}/2)
-                </h2>
-                <div className="space-y-4">
-                  {players.map((participant) => (
-                    <div
-                      key={participant.user_id}
-                      className="flex items-center justify-between bg-gray-700 rounded-lg p-4"
-                    >
-                      <div className="flex items-center space-x-3">
-                        <div className="w-10 h-10 bg-red-600 rounded-full flex items-center justify-center">
-                          {participant.profile.username.charAt(0).toUpperCase()}
-                        </div>
-                        <div>
-                          <div className="font-semibold">{participant.profile.username}</div>
-                          <div className="text-sm text-gray-400">Niveau {participant.profile.level}</div>
-                        </div>
-                        {participant.user_id === currentRoom.host_id && (
-                          <div className="bg-yellow-600 text-black px-2 py-1 rounded text-xs font-semibold">
-                            HÔTE
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        {participant.status === 'ready' ? (
-                          <div className="flex items-center space-x-1 text-green-400">
-                            <UserCheck className="w-4 h-4" />
-                            <span className="text-sm">Prêt</span>
-                          </div>
-                        ) : (
-                          <div className="flex items-center space-x-1 text-gray-400">
-                            <UserX className="w-4 h-4" />
-                            <span className="text-sm">En attente</span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+          {(error || matchmaking.error) && (
+            <div className="bg-red-900 border border-red-600 text-red-200 px-4 py-3 rounded-lg mb-6 flex items-center gap-2">
+              <AlertCircle className="w-5 h-5" />
+              {error || matchmaking.error}
+              <button onClick={() => {setError(null);}} className="ml-auto text-red-400 hover:text-red-200">✕</button>
             </div>
+          )}
 
-            {/* Contrôles */}
-            <div className="space-y-6">
-              <div className="bg-gray-800 rounded-lg p-6">
-                <h3 className="text-xl font-bold mb-4">Contrôles</h3>
-                <div className="space-y-4">
-                  <button
-                    onClick={toggleReady}
-                    className={`w-full py-3 rounded-lg font-semibold transition-colors ${
-                      isReady
-                        ? 'bg-green-600 hover:bg-green-700'
-                        : 'bg-gray-600 hover:bg-gray-700'
+          {/* Sélection de deck */}
+          <div className="bg-slate-800 rounded-lg p-6 mb-6">
+            <h2 className="text-2xl font-bold text-white mb-4">🃏 Sélectionnez votre deck</h2>
+            {userDecks.length === 0 ? (
+              <div className="text-center py-8">
+                <p className="text-gray-400 mb-4">Vous devez créer un deck pour jouer en ligne</p>
+                <button
+                  onClick={onBack}
+                  className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-bold"
+                >
+                  Créer un deck
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {userDecks.map(deck => (
+                  <div
+                    key={deck.id}
+                    onClick={() => setSelectedDeck(deck)}
+                    className={`p-4 rounded-lg border-2 cursor-pointer transition-all ${
+                      selectedDeck?.id === deck.id
+                        ? 'border-blue-500 bg-blue-900/50'
+                        : 'border-gray-600 bg-slate-700 hover:border-gray-500'
                     }`}
                   >
-                    {isReady ? 'Prêt ✓' : 'Pas Prêt'}
-                  </button>
-                  
-                  {isHost && (
-                    <button
-                      onClick={startGame}
-                      disabled={!canStart}
-                      className={`w-full py-3 rounded-lg font-semibold transition-colors flex items-center justify-center space-x-2 ${
-                        canStart
-                          ? 'bg-red-600 hover:bg-red-700'
-                          : 'bg-gray-600 cursor-not-allowed'
-                      }`}
-                    >
-                      <Play className="w-5 h-5" />
-                      <span>Démarrer le Combat</span>
-                    </button>
-                  )}
-                </div>
+                    <h3 className="text-white font-bold">{deck.name}</h3>
+                    <p className="text-gray-300 text-sm">{deck.cards.length} cartes</p>
+                    {deck.is_active && (
+                      <span className="inline-block bg-green-600 text-white text-xs px-2 py-1 rounded mt-2">
+                        Deck actif
+                      </span>
+                    )}
+                  </div>
+                ))}
               </div>
-
-              <div className="bg-gray-800 rounded-lg p-6">
-                <h3 className="text-xl font-bold mb-4">Paramètres</h3>
-                <div className="space-y-2 text-sm">
-                  <div className="flex justify-between">
-                    <span>Temps limite:</span>
-                    <span>{currentRoom.settings.time_limit}s</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Rounds:</span>
-                    <span>{currentRoom.settings.rounds}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Joueurs max:</span>
-                    <span>{currentRoom.max_players}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
+            )}
           </div>
 
-          {/* ✅ CORRECTION : Composant Debug */}
-          {process.env.NODE_ENV === 'development' && (
-            <div className="bg-gray-900 p-4 rounded mt-4">
-              <h4 className="text-white font-bold mb-2">🔧 Debug Info</h4>
-              <div className="text-sm text-gray-300 space-y-1">
-                <div>Total participants: {roomParticipants.length}</div>
-                <div>Joueurs valides: {players.length}</div>
-                <div>Joueurs prêts: {readyPlayers.length}</div>
-                <div>Est hôte: {isHost ? 'Oui' : 'Non'}</div>
-                <div>Peut démarrer: {canStart ? 'Oui' : 'Non'}</div>
-                <div className="mt-2">
-                  <div className="font-bold">Participants:</div>
-                  {roomParticipants.map(p => (
-                    <div key={p.user_id} className="ml-2">
-                      {p.profile?.username || 'PROFIL MANQUANT'} - {p.status} - {p.role}
-                    </div>
-                  ))}
+          {/* Matchmaking */}
+          {selectedDeck && (
+            <div className="flex justify-center">
+              <div className="bg-gradient-to-br from-blue-600 to-blue-800 p-8 rounded-xl shadow-lg hover:shadow-2xl transition-all duration-300 hover:scale-105 max-w-md w-full">
+                <div className="text-center">
+                  <Users className="w-16 h-16 text-blue-200 mx-auto mb-6" />
+                  <h3 className="text-2xl font-bold text-white mb-4">Combat Décontracté</h3>
+                  <p className="text-blue-100 text-sm mb-6">Trouvez un adversaire de votre niveau pour un combat amical</p>
+                  
+                  <div className="bg-blue-700/50 rounded-lg p-4 mb-6">
+                    <div className="text-white font-bold mb-2">Deck sélectionné:</div>
+                    <div className="text-blue-200">{selectedDeck.name}</div>
+                    <div className="text-blue-300 text-sm">{selectedDeck.cards.length} cartes</div>
+                  </div>
+
+                  <button
+                    onClick={enterMatchmaking}
+                    disabled={loading || matchmaking.isSearching}
+                    className="w-full bg-blue-500 hover:bg-blue-600 disabled:bg-gray-600 text-white px-6 py-3 rounded-lg font-bold text-lg transition-colors"
+                  >
+                    {matchmaking.isSearching ? 'Recherche en cours...' : '🎮 Rechercher un match'}
+                  </button>
                 </div>
               </div>
             </div>
@@ -490,122 +380,195 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ onBack }) => {
     );
   }
 
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white p-4">
-      <div className="max-w-6xl mx-auto">
-        <div className="flex items-center justify-between mb-8">
-          <button
-            onClick={onBack}
-            className="flex items-center space-x-2 text-gray-300 hover:text-white transition-colors"
-          >
-            <ArrowLeft className="w-5 h-5" />
-            <span>Retour au Menu</span>
-          </button>
-          <h1 className="text-4xl font-bold flex items-center">
-            <Swords className="w-8 h-8 mr-3" />
-            Combat en Ligne
-          </h1>
-          <button
-            onClick={() => setShowCreateRoom(true)}
-            className="bg-red-600 hover:bg-red-700 px-6 py-3 rounded-lg font-semibold transition-colors"
-          >
-            Créer une Salle
-          </button>
-        </div>
+  // Interface de matchmaking
+  if (currentView === 'matchmaking') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center p-4">
+        <div className="bg-slate-800 rounded-xl p-8 text-center max-w-md w-full">
+          {matchmaking.status === 'searching' && (
+            <>
+              <div className="animate-spin w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full mx-auto mb-6"></div>
+              <h2 className="text-2xl font-bold text-white mb-4">🔍 Recherche d'adversaire</h2>
+              <p className="text-gray-300 mb-6">Temps d'attente: {formatTime(matchmaking.queueTime)}</p>
+            </>
+          )}
 
-        {/* Liste des salles */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {rooms.map((room) => (
-            <div key={room.id} className="bg-gray-800 rounded-lg p-6 hover:bg-gray-700 transition-colors">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-xl font-bold">{room.name}</h3>
-                <div className="flex items-center space-x-2 text-sm text-gray-400">
-                  <Users className="w-4 h-4" />
-                  <span>0/{room.max_players}</span>
-                </div>
+          {matchmaking.status === 'match_found' && (
+            <>
+              <div className="w-16 h-16 bg-green-600 rounded-full flex items-center justify-center mx-auto mb-6">
+                <Check className="w-8 h-8 text-white" />
               </div>
-              
-              <div className="space-y-2 text-sm text-gray-300 mb-4">
-                <div className="flex justify-between">
-                  <span>Temps limite:</span>
-                  <span>{room.settings.time_limit}s</span>
+              <h2 className="text-2xl font-bold text-white mb-4">✅ Adversaire trouvé !</h2>
+              {matchmaking.opponent && (
+                <div className="bg-slate-700 rounded-lg p-4 mb-6">
+                  <p className="text-white font-bold">{matchmaking.opponent.username}</p>
+                  <p className="text-gray-300">Niveau {matchmaking.opponent.level}</p>
                 </div>
-                <div className="flex justify-between">
-                  <span>Rounds:</span>
-                  <span>{room.settings.rounds}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Créée:</span>
-                  <span>{new Date(room.created_at).toLocaleTimeString()}</span>
-                </div>
-              </div>
+              )}
+              <p className="text-gray-300 mb-6">Connexion à la salle de jeu...</p>
+            </>
+          )}
 
-              <button
-                onClick={() => joinRoom(room)}
-                disabled={loading}
-                className="w-full bg-red-600 hover:bg-red-700 py-2 rounded-lg font-semibold transition-colors disabled:opacity-50"
-              >
-                {loading ? 'Connexion...' : 'Rejoindre'}
-              </button>
+          {matchmaking.status === 'error' && (
+            <>
+              <div className="w-16 h-16 bg-red-600 rounded-full flex items-center justify-center mx-auto mb-6">
+                <AlertCircle className="w-8 h-8 text-white" />
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-4">❌ Erreur</h2>
+              <p className="text-red-300 mb-6">{matchmaking.error}</p>
+            </>
+          )}
+
+          <div className="space-y-4">
+            <div className="bg-slate-700 rounded-lg p-4">
+              <p className="text-white font-bold">Deck sélectionné:</p>
+              <p className="text-gray-300">{selectedDeck?.name}</p>
             </div>
-          ))}
+            <div className="bg-slate-700 rounded-lg p-4">
+              <p className="text-white font-bold">Niveau recherché:</p>
+              <p className="text-gray-300">{Math.max(1, user.level - 5)} - {user.level + 5}</p>
+            </div>
+            
+            {matchmaking.status !== 'match_found' && (
+              <button
+                onClick={() => {
+                  matchmaking.cancelSearch();
+                  setCurrentView('menu');
+                }}
+                className="w-full bg-red-600 hover:bg-red-700 text-white px-6 py-3 rounded-lg font-bold transition-colors"
+              >
+                Annuler la recherche
+              </button>
+            )}
+          </div>
         </div>
+      </div>
+    );
+  }
 
-        {rooms.length === 0 && (
-          <div className="text-center py-12">
-            <div className="text-6xl mb-4">⚔️</div>
-            <h2 className="text-2xl font-bold mb-4">Aucune salle disponible</h2>
-            <p className="text-gray-400 mb-8">Créez une nouvelle salle pour commencer un combat!</p>
+  // Interface de salle d'attente
+  if (currentView === 'room' && currentRoom) {
+    const isHost = currentRoom.host_id === user.id;
+    const players = roomParticipants.filter(p => p.role === 'player');
+    const readyPlayers = players.filter(p => p.status === 'ready');
+    const canStart = players.length === 2 && readyPlayers.length === 2 && isHost;
+
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex justify-between items-center mb-6">
+            <h1 className="text-3xl font-bold text-white">🎮 Salle de Combat</h1>
             <button
-              onClick={() => setShowCreateRoom(true)}
-              className="bg-red-600 hover:bg-red-700 px-8 py-4 rounded-lg font-semibold transition-colors"
+              onClick={() => setCurrentView('menu')}
+              className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg font-bold transition-colors"
             >
-              Créer une Salle
+              Quitter
             </button>
           </div>
-        )}
 
-        {/* Modal création de salle */}
-        {showCreateRoom && (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 rounded-lg p-6 w-full max-w-md">
-              <h2 className="text-2xl font-bold mb-4">Créer une Salle</h2>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium mb-2">Nom de la salle</label>
-                  <input
-                    type="text"
-                    value={newRoomName}
-                    onChange={(e) => setNewRoomName(e.target.value)}
-                    className="w-full bg-gray-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-red-500"
-                    placeholder="Ma salle de combat"
-                    maxLength={50}
-                  />
-                </div>
-              </div>
-
-              <div className="flex space-x-4 mt-6">
-                <button
-                  onClick={() => setShowCreateRoom(false)}
-                  className="flex-1 bg-gray-600 hover:bg-gray-700 py-2 rounded-lg font-semibold transition-colors"
-                >
-                  Annuler
-                </button>
-                <button
-                  onClick={createRoom}
-                  disabled={!newRoomName.trim() || loading}
-                  className="flex-1 bg-red-600 hover:bg-red-700 py-2 rounded-lg font-semibold transition-colors disabled:opacity-50"
-                >
-                  {loading ? 'Création...' : 'Créer'}
-                </button>
+          {/* Compte à rebours de démarrage */}
+          {gameStartCountdown > 0 && (
+            <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
+              <div className="bg-slate-800 rounded-xl p-8 text-center">
+                <Clock className="w-16 h-16 text-yellow-400 mx-auto mb-4" />
+                <h2 className="text-3xl font-bold text-white mb-4">Le combat commence dans</h2>
+                <div className="text-6xl font-bold text-yellow-400 mb-4">{gameStartCountdown}</div>
+                <p className="text-gray-300">Préparez-vous !</p>
               </div>
             </div>
+          )}
+
+          <div className="bg-slate-800 rounded-lg p-6">
+            <h2 className="text-2xl font-bold text-white mb-4">⚔️ Joueurs ({players.length}/2)</h2>
+            <div className="space-y-4">
+              {[1, 2].map(playerNum => {
+                const player = players.find(p => p.player_number === playerNum);
+                return (
+                  <div key={playerNum} className={`p-4 rounded-lg border-2 ${
+                    player ? 'border-green-500 bg-green-900/20' : 'border-gray-600 bg-slate-700'
+                  }`}>
+                    {player ? (
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          {player.user_id === currentRoom.host_id && (
+                            <div className="w-5 h-5 bg-yellow-400 rounded-full flex items-center justify-center">
+                              👑
+                            </div>
+                          )}
+                          <div>
+                            <p className="text-white font-bold">
+                              {player.profile?.username || 'Chargement...'}
+                            </p>
+                            <p className="text-gray-300 text-sm">
+                              Niveau {player.profile?.level || 'N/A'}
+                            </p>
+                          </div>
+                        </div>
+                        <div className={`px-3 py-1 rounded text-sm font-bold ${
+                          player.status === 'ready' ? 'bg-green-600 text-white' : 'bg-yellow-600 text-white'
+                        }`}>
+                          {player.status === 'ready' ? '✅ Prêt' : '⏳ En attente'}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-center text-gray-400">
+                        <Users className="w-8 h-8 mx-auto mb-2" />
+                        <p>En attente d'un joueur...</p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Contrôles de la salle */}
+            <div className="mt-6 space-y-4">
+              {/* Bouton Prêt/Pas prêt pour les joueurs */}
+              {players.some(p => p.user_id === user.id) && (
+                <button
+                  onClick={toggleReady}
+                  disabled={loading}
+                  className={`w-full px-6 py-3 rounded-lg font-bold text-lg transition-colors ${
+                    isReady 
+                      ? 'bg-yellow-600 hover:bg-yellow-700 text-white' 
+                      : 'bg-green-600 hover:bg-green-700 text-white'
+                  }`}
+                >
+                  {loading ? 'Changement...' : isReady ? '⏳ Pas prêt' : '✅ Prêt'}
+                </button>
+              )}
+
+              {/* Bouton démarrer pour l'hôte */}
+              {canStart && (
+                <button
+                  onClick={startGame}
+                  disabled={loading}
+                  className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white px-6 py-3 rounded-lg font-bold text-lg animate-pulse"
+                >
+                  {loading ? 'Démarrage...' : '🚀 Démarrer le combat !'}
+                </button>
+              )}
+
+              {/* Messages d'attente */}
+              {players.length === 2 && readyPlayers.length < 2 && (
+                <div className="text-center text-yellow-400 font-bold">
+                  En attente que tous les joueurs soient prêts...
+                </div>
+              )}
+
+              {players.length < 2 && (
+                <div className="text-center text-blue-400 font-bold">
+                  En attente d'un second joueur...
+                </div>
+              )}
+            </div>
           </div>
-        )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  return null;
 };
 
 export default OnlineCombat;
