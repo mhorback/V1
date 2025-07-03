@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
 import { useMatchmaking } from '../hooks/useMatchmaking';
-import { Wifi, WifiOff, AlertCircle, Clock, Check, Users, RefreshCw, AlertTriangle, Loader } from 'lucide-react';
+import { Wifi, WifiOff, AlertCircle, Clock, Check, Users, RefreshCw, AlertTriangle, Loader, Shield, Sword, Heart, Zap, Coins } from 'lucide-react';
 import GameBoard from './GameBoard';
 
 // Interfaces pour typer les données
@@ -39,6 +39,18 @@ interface User {
   level: number;
 }
 
+interface Fighter {
+  id: number;
+  name: string;
+  rarity: string;
+  force: number;
+  pv: number;
+  endurance: number;
+  vitesse: number;
+  valeur: number;
+  image?: string | null;
+}
+
 interface Deck {
   id: number;
   name: string;
@@ -46,13 +58,27 @@ interface Deck {
   is_active: boolean;
 }
 
+interface DeckValidation {
+  isValid: boolean;
+  errors: string[];
+  warnings: string[];
+  stats: {
+    totalCards: number;
+    totalValue: number;
+    averageForce: number;
+    averagePV: number;
+    rarityDistribution: Record<string, number>;
+  };
+}
+
 interface OnlineCombatProps {
   user: User;
   userDecks: Deck[];
+  fightersDatabase: Fighter[];
   onBack: () => void;
 }
 
-const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) => {
+const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, fightersDatabase, onBack }) => {
   const [currentView, setCurrentView] = useState<'menu' | 'matchmaking' | 'room' | 'game'>('menu');
   const [currentRoom, setCurrentRoom] = useState<GameRoom | null>(null);
   const [roomParticipants, setRoomParticipants] = useState<RoomParticipant[]>([]);
@@ -60,6 +86,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedDeck, setSelectedDeck] = useState<Deck | null>(null);
+  const [deckValidation, setDeckValidation] = useState<DeckValidation | null>(null);
   const [isReady, setIsReady] = useState(false);
   const [gameStartCountdown, setGameStartCountdown] = useState(0);
   const [matchmakingTimeout, setMatchmakingTimeout] = useState<NodeJS.Timeout | null>(null);
@@ -71,8 +98,110 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
   const MAX_CONNECTION_RETRIES = 3;
   const PROFILE_RETRY_DELAY = 2000; // 2 secondes
 
+  // Règles de validation des decks
+  const DECK_RULES = {
+    minCards: 15,
+    maxCards: 30,
+    maxValue: 1500000, // 1.5M PO
+    maxCopiesPerCard: 3
+  };
+
   // Hook de matchmaking
   const matchmaking = useMatchmaking(user);
+
+  // Valider un deck
+  const validateDeck = useCallback((deck: Deck): DeckValidation => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    
+    // Calculer les statistiques du deck
+    let totalCards = 0;
+    let totalValue = 0;
+    let totalForce = 0;
+    let totalPV = 0;
+    const rarityDistribution: Record<string, number> = {};
+    const cardCounts: Record<number, number> = {};
+
+    // Analyser chaque carte du deck
+    for (const deckCard of deck.cards) {
+      const quantity = deckCard.quantity || 1;
+      const fighter = fightersDatabase.find(f => f.id === deckCard.card_id);
+      
+      if (!fighter) {
+        errors.push(`Carte introuvable: ID ${deckCard.card_id}`);
+        continue;
+      }
+
+      totalCards += quantity;
+      totalValue += fighter.valeur * quantity;
+      totalForce += fighter.force * quantity;
+      totalPV += fighter.pv * quantity;
+      
+      // Distribution par rareté
+      rarityDistribution[fighter.rarity] = (rarityDistribution[fighter.rarity] || 0) + quantity;
+      
+      // Vérifier le nombre de copies
+      cardCounts[fighter.id] = (cardCounts[fighter.id] || 0) + quantity;
+      if (cardCounts[fighter.id] > DECK_RULES.maxCopiesPerCard) {
+        errors.push(`Trop de copies de ${fighter.name} (${cardCounts[fighter.id]}/${DECK_RULES.maxCopiesPerCard})`);
+      }
+    }
+
+    // Vérifications des règles
+    if (totalCards < DECK_RULES.minCards) {
+      errors.push(`Pas assez de cartes (${totalCards}/${DECK_RULES.minCards} minimum)`);
+    }
+    
+    if (totalCards > DECK_RULES.maxCards) {
+      errors.push(`Trop de cartes (${totalCards}/${DECK_RULES.maxCards} maximum)`);
+    }
+    
+    if (totalValue > DECK_RULES.maxValue) {
+      errors.push(`Valeur trop élevée (${(totalValue / 1000).toFixed(0)}k/${(DECK_RULES.maxValue / 1000).toFixed(0)}k PO)`);
+    }
+
+    // Avertissements
+    if (totalCards < 20) {
+      warnings.push('Deck assez petit, considérez ajouter plus de cartes');
+    }
+    
+    if (!rarityDistribution['Légendaire'] && !rarityDistribution['Épique']) {
+      warnings.push('Aucune carte rare, votre deck pourrait manquer de puissance');
+    }
+    
+    if (totalValue < DECK_RULES.maxValue * 0.7) {
+      warnings.push('Valeur assez faible, vous pourriez optimiser votre deck');
+    }
+
+    const averageForce = totalCards > 0 ? totalForce / totalCards : 0;
+    const averagePV = totalCards > 0 ? totalPV / totalCards : 0;
+
+    return {
+      isValid: errors.length === 0,
+      errors,
+      warnings,
+      stats: {
+        totalCards,
+        totalValue,
+        averageForce,
+        averagePV,
+        rarityDistribution
+      }
+    };
+  }, [fightersDatabase]);
+
+  // Sélectionner un deck et le valider
+  const selectDeck = useCallback((deck: Deck) => {
+    setSelectedDeck(deck);
+    const validation = validateDeck(deck);
+    setDeckValidation(validation);
+    
+    if (!validation.isValid) {
+      setError(`Deck invalide: ${validation.errors.join(', ')}`);
+    } else {
+      setError(null);
+    }
+  }, [validateDeck]);
 
   // Gestion robuste des erreurs de profil
   const loadRoomParticipants = useCallback(async (roomId: string, retryCount = 0): Promise<void> => {
@@ -228,10 +357,17 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
     }
   }, [matchmakingTimeout]);
 
-  // Entrer en file d'attente avec timeout
+  // Entrer en file d'attente avec validation du deck
   const enterMatchmaking = async () => {
     if (!selectedDeck) {
       setError('Veuillez sélectionner un deck');
+      return;
+    }
+
+    // Valider le deck avant de commencer
+    const validation = validateDeck(selectedDeck);
+    if (!validation.isValid) {
+      setError(`Deck invalide: ${validation.errors.join(', ')}`);
       return;
     }
 
@@ -505,6 +641,14 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
     };
   }, [clearMatchmakingTimeout]);
 
+  // Valider le deck sélectionné au changement
+  useEffect(() => {
+    if (selectedDeck) {
+      const validation = validateDeck(selectedDeck);
+      setDeckValidation(validation);
+    }
+  }, [selectedDeck, validateDeck]);
+
   // Gérer la fin de partie
   const handleGameEnd = (winner: string) => {
     alert(`${winner} a gagné la partie !`);
@@ -585,32 +729,176 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
                 </button>
               </div>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {userDecks.map(deck => (
-                  <div
-                    key={deck.id}
-                    onClick={() => setSelectedDeck(deck)}
-                    className={`p-4 rounded-lg border-2 cursor-pointer transition-all ${
-                      selectedDeck?.id === deck.id
-                        ? 'border-blue-500 bg-blue-900/50'
-                        : 'border-gray-600 bg-slate-700 hover:border-gray-500'
-                    }`}
-                  >
-                    <h3 className="text-white font-bold">{deck.name}</h3>
-                    <p className="text-gray-300 text-sm">{deck.cards.length} cartes</p>
-                    {deck.is_active && (
-                      <span className="inline-block bg-green-600 text-white text-xs px-2 py-1 rounded mt-2">
-                        Deck actif
-                      </span>
-                    )}
-                  </div>
-                ))}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {userDecks.map(deck => {
+                  const validation = validateDeck(deck);
+                  const isSelected = selectedDeck?.id === deck.id;
+                  
+                  return (
+                    <div
+                      key={deck.id}
+                      onClick={() => selectDeck(deck)}
+                      className={`p-4 rounded-lg border-2 cursor-pointer transition-all ${
+                        isSelected
+                          ? validation.isValid 
+                            ? 'border-green-500 bg-green-900/50' 
+                            : 'border-red-500 bg-red-900/50'
+                          : validation.isValid
+                            ? 'border-gray-600 bg-slate-700 hover:border-gray-500'
+                            : 'border-red-600 bg-red-900/20 hover:border-red-500'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <h3 className="text-white font-bold">{deck.name}</h3>
+                        {validation.isValid ? (
+                          <Check className="w-5 h-5 text-green-400" />
+                        ) : (
+                          <AlertTriangle className="w-5 h-5 text-red-400" />
+                        )}
+                      </div>
+                      
+                      <div className="space-y-2">
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-300">Cartes:</span>
+                          <span className={`font-bold ${
+                            validation.stats.totalCards >= DECK_RULES.minCards && 
+                            validation.stats.totalCards <= DECK_RULES.maxCards
+                              ? 'text-green-400' : 'text-red-400'
+                          }`}>
+                            {validation.stats.totalCards}
+                          </span>
+                        </div>
+                        
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-300">Valeur:</span>
+                          <span className={`font-bold ${
+                            validation.stats.totalValue <= DECK_RULES.maxValue
+                              ? 'text-green-400' : 'text-red-400'
+                          }`}>
+                            {(validation.stats.totalValue / 1000).toFixed(0)}k PO
+                          </span>
+                        </div>
+                        
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-300">Force moy.:</span>
+                          <span className="text-blue-400 font-bold">
+                            {validation.stats.averageForce.toFixed(1)}
+                          </span>
+                        </div>
+                        
+                        {deck.is_active && (
+                          <span className="inline-block bg-green-600 text-white text-xs px-2 py-1 rounded">
+                            Deck actif
+                          </span>
+                        )}
+                        
+                        {!validation.isValid && (
+                          <div className="text-red-300 text-xs mt-2">
+                            {validation.errors[0]}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
 
+          {/* Validation du deck sélectionné */}
+          {selectedDeck && deckValidation && (
+            <div className="bg-slate-800 rounded-lg p-6 mb-6">
+              <h3 className="text-xl font-bold text-white mb-4">📊 Analyse du deck: {selectedDeck.name}</h3>
+              
+              {/* Statistiques */}
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+                <div className="text-center p-3 rounded-lg bg-slate-700">
+                  <div className="text-2xl font-bold text-blue-400">{deckValidation.stats.totalCards}</div>
+                  <div className="text-xs text-gray-300">Cartes</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-slate-700">
+                  <div className="text-2xl font-bold text-yellow-400">
+                    {(deckValidation.stats.totalValue / 1000).toFixed(0)}k
+                  </div>
+                  <div className="text-xs text-gray-300">Valeur</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-slate-700">
+                  <div className="text-2xl font-bold text-red-400">
+                    {deckValidation.stats.averageForce.toFixed(1)}
+                  </div>
+                  <div className="text-xs text-gray-300">Force moy.</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-slate-700">
+                  <div className="text-2xl font-bold text-green-400">
+                    {deckValidation.stats.averagePV.toFixed(1)}
+                  </div>
+                  <div className="text-xs text-gray-300">PV moy.</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-slate-700">
+                  <div className="text-2xl font-bold text-purple-400">
+                    {deckValidation.stats.rarityDistribution['Légendaire'] || 0}
+                  </div>
+                  <div className="text-xs text-gray-300">Légendaires</div>
+                </div>
+              </div>
+
+              {/* Erreurs */}
+              {deckValidation.errors.length > 0 && (
+                <div className="bg-red-900/50 border border-red-600 rounded-lg p-4 mb-4">
+                  <h4 className="text-red-200 font-bold mb-2 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4" />
+                    Erreurs à corriger:
+                  </h4>
+                  <ul className="text-red-300 text-sm space-y-1">
+                    {deckValidation.errors.map((error, index) => (
+                      <li key={index}>• {error}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Avertissements */}
+              {deckValidation.warnings.length > 0 && (
+                <div className="bg-yellow-900/50 border border-yellow-600 rounded-lg p-4 mb-4">
+                  <h4 className="text-yellow-200 font-bold mb-2 flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4" />
+                    Suggestions d'amélioration:
+                  </h4>
+                  <ul className="text-yellow-300 text-sm space-y-1">
+                    {deckValidation.warnings.map((warning, index) => (
+                      <li key={index}>• {warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Statut de validation */}
+              <div className={`p-4 rounded-lg border-2 ${
+                deckValidation.isValid 
+                  ? 'bg-green-900/50 border-green-600' 
+                  : 'bg-red-900/50 border-red-600'
+              }`}>
+                <div className={`font-bold flex items-center gap-2 ${
+                  deckValidation.isValid ? 'text-green-200' : 'text-red-200'
+                }`}>
+                  {deckValidation.isValid ? (
+                    <>
+                      <Check className="w-5 h-5" />
+                      Deck valide pour le combat en ligne
+                    </>
+                  ) : (
+                    <>
+                      <AlertTriangle className="w-5 h-5" />
+                      Deck invalide - Corrigez les erreurs ci-dessus
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Matchmaking */}
-          {selectedDeck && (
+          {selectedDeck && deckValidation?.isValid && (
             <div className="flex justify-center">
               <div className="bg-gradient-to-br from-blue-600 to-blue-800 p-8 rounded-xl shadow-lg hover:shadow-2xl transition-all duration-300 hover:scale-105 max-w-md w-full">
                 <div className="text-center">
@@ -621,7 +909,13 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
                   <div className="bg-blue-700/50 rounded-lg p-4 mb-6">
                     <div className="text-white font-bold mb-2">Deck sélectionné:</div>
                     <div className="text-blue-200">{selectedDeck.name}</div>
-                    <div className="text-blue-300 text-sm">{selectedDeck.cards.length} cartes</div>
+                    <div className="text-blue-300 text-sm">
+                      {deckValidation.stats.totalCards} cartes • {(deckValidation.stats.totalValue / 1000).toFixed(0)}k PO
+                    </div>
+                    <div className="text-green-300 text-xs mt-1 flex items-center justify-center gap-1">
+                      <Check className="w-3 h-3" />
+                      Deck validé
+                    </div>
                   </div>
 
                   <button
@@ -713,6 +1007,12 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
             <div className="bg-slate-700 rounded-lg p-4">
               <p className="text-white font-bold">Deck sélectionné:</p>
               <p className="text-gray-300">{selectedDeck?.name}</p>
+              {deckValidation && (
+                <div className="text-green-300 text-xs mt-1 flex items-center justify-center gap-1">
+                  <Check className="w-3 h-3" />
+                  {deckValidation.stats.totalCards} cartes validées
+                </div>
+              )}
             </div>
             <div className="bg-slate-700 rounded-lg p-4">
               <p className="text-white font-bold">Niveau recherché:</p>
