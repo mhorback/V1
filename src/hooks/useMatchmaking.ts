@@ -1,6 +1,58 @@
 import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
 
+// Interfaces pour typer les données
+interface UserProfile {
+  username: string;
+  level: number;
+}
+
+interface QueueEntry {
+  id: string;
+  user_id: string;
+  game_mode: string;
+  deck_id: number;
+  preferred_level_min: number;
+  preferred_level_max: number;
+  status: string;
+  created_at: string;
+  matched_at?: string;
+  profile?: UserProfile;
+}
+
+interface GameRoom {
+  id: string;
+  name: string;
+  host_id: string;
+  status: string;
+  max_players: number;
+  current_players: number;
+  game_mode: string;
+  created_at: string;
+}
+
+interface RoomParticipant {
+  id: string;
+  room_id: string;
+  user_id: string;
+  role: string;
+  player_number?: number;
+  deck_id?: number;
+  status: string;
+  joined_at: string;
+  profile?: UserProfile;
+}
+
+interface MatchResult {
+  status: 'match_found' | 'searching';
+  room_id?: string;
+  queue_id?: string;
+  opponent?: {
+    username: string;
+    level: number;
+  };
+}
+
 interface MatchmakingState {
   isSearching: boolean;
   queueTime: number;
@@ -14,7 +66,13 @@ interface MatchmakingState {
   selectedDeckId?: number;
 }
 
-export const useMatchmaking = (user: any) => {
+interface User {
+  id: string;
+  username: string;
+  level: number;
+}
+
+export const useMatchmaking = (user: User) => {
   const [state, setState] = useState<MatchmakingState>({
     isSearching: false,
     queueTime: 0,
@@ -25,7 +83,7 @@ export const useMatchmaking = (user: any) => {
   const [subscription, setSubscription] = useState<any>(null);
 
   // Nettoyer les anciennes entrées de file d'attente
-  const cleanupOldQueueEntries = async () => {
+  const cleanupOldQueueEntries = async (): Promise<void> => {
     try {
       await supabase
         .from('matchmaking_queue')
@@ -39,7 +97,7 @@ export const useMatchmaking = (user: any) => {
   };
 
   // Vérifier si l'utilisateur a déjà une salle active
-  const checkExistingRoom = async () => {
+  const checkExistingRoom = async (): Promise<boolean> => {
     try {
       const { data: existingParticipation } = await supabase
         .from('room_participants')
@@ -53,7 +111,7 @@ export const useMatchmaking = (user: any) => {
         .limit(1);
 
       if (existingParticipation && existingParticipation.length > 0) {
-        const room = existingParticipation[0].room;
+        const room = existingParticipation[0].room as GameRoom;
         console.log('Salle existante trouvée:', room);
         
         setState(prev => ({
@@ -74,7 +132,7 @@ export const useMatchmaking = (user: any) => {
   };
 
   // Recherche directe d'un match avec la fonction PostgreSQL
-  const findMatchWithFunction = async (gameMode: string, deckId: number, userLevel: number) => {
+  const findMatchWithFunction = async (gameMode: string, deckId: number, userLevel: number): Promise<MatchResult> => {
     try {
       console.log('Recherche de match avec fonction PostgreSQL...');
       
@@ -123,7 +181,7 @@ export const useMatchmaking = (user: any) => {
   };
 
   // Fallback pour la recherche de match
-  const findMatchFallback = async (gameMode: string, deckId: number, userLevel: number) => {
+  const findMatchFallback = async (gameMode: string, deckId: number, userLevel: number): Promise<MatchResult> => {
     try {
       console.log('Utilisation du fallback pour la recherche de match...');
       
@@ -149,7 +207,13 @@ export const useMatchmaking = (user: any) => {
         .limit(1);
 
       if (potentialOpponents && potentialOpponents.length > 0) {
-        const opponent = potentialOpponents[0];
+        const opponent = potentialOpponents[0] as QueueEntry;
+        
+        // Vérifier que l'adversaire a un profil valide
+        if (!opponent.profile) {
+          console.log('Adversaire sans profil valide, ajout à la file');
+          return await addToQueue(gameMode, deckId, userLevel);
+        }
         
         // Vérifier que l'adversaire est toujours disponible
         const { data: stillAvailable } = await supabase
@@ -185,11 +249,13 @@ export const useMatchmaking = (user: any) => {
 
         if (roomError) throw roomError;
 
+        const createdRoom = room as GameRoom;
+
         // Ajouter les deux joueurs à la salle
         const { error: participant1Error } = await supabase
           .from('room_participants')
           .insert({
-            room_id: room.id,
+            room_id: createdRoom.id,
             user_id: user.id,
             role: 'player',
             player_number: 1,
@@ -202,7 +268,7 @@ export const useMatchmaking = (user: any) => {
         const { error: participant2Error } = await supabase
           .from('room_participants')
           .insert({
-            room_id: room.id,
+            room_id: createdRoom.id,
             user_id: opponent.user_id,
             role: 'player',
             player_number: 2,
@@ -220,7 +286,7 @@ export const useMatchmaking = (user: any) => {
 
         return { 
           status: 'match_found', 
-          room_id: room.id,
+          room_id: createdRoom.id,
           opponent: {
             username: opponent.profile.username,
             level: opponent.profile.level
@@ -237,7 +303,7 @@ export const useMatchmaking = (user: any) => {
   };
 
   // Ajouter à la file d'attente
-  const addToQueue = async (gameMode: string, deckId: number, userLevel: number) => {
+  const addToQueue = async (gameMode: string, deckId: number, userLevel: number): Promise<MatchResult> => {
     const levelMin = Math.max(1, userLevel - 5);
     const levelMax = userLevel + 5;
 
@@ -276,22 +342,24 @@ export const useMatchmaking = (user: any) => {
 
         if (updateError) throw updateError;
         
+        const updatedQueueEntry = updatedEntry as QueueEntry;
         return { 
           status: 'searching', 
-          queue_id: updatedEntry.id
+          queue_id: updatedQueueEntry.id
         };
       }
       throw queueError;
     }
 
+    const createdQueueEntry = queueEntry as QueueEntry;
     return { 
       status: 'searching', 
-      queue_id: queueEntry.id
+      queue_id: createdQueueEntry.id
     };
   };
 
   // Démarrer la recherche
-  const startSearch = useCallback(async (gameMode: string, deckId: number, userLevel: number) => {
+  const startSearch = useCallback(async (gameMode: string, deckId: number, userLevel: number): Promise<void> => {
     try {
       console.log('Démarrage de la recherche de match...');
       
@@ -340,7 +408,7 @@ export const useMatchmaking = (user: any) => {
   }, [user.id]);
 
   // Écoute en temps réel pour les nouveaux adversaires
-  const startRealtimeListening = (gameMode: string, deckId: number, userLevel: number) => {
+  const startRealtimeListening = (gameMode: string, deckId: number, userLevel: number): void => {
     console.log('Démarrage de l\'écoute en temps réel...');
     
     // Arrêter l'ancienne subscription
@@ -357,7 +425,7 @@ export const useMatchmaking = (user: any) => {
         table: 'matchmaking_queue',
         filter: `game_mode=eq.${gameMode}`
       }, async (payload) => {
-        const newEntry = payload.new;
+        const newEntry = payload.new as QueueEntry;
         
         console.log('Nouvelle entrée dans la file:', newEntry);
         
@@ -427,7 +495,7 @@ export const useMatchmaking = (user: any) => {
   };
 
   // Annuler la recherche
-  const cancelSearch = useCallback(async () => {
+  const cancelSearch = useCallback(async (): Promise<void> => {
     try {
       console.log('Annulation de la recherche...');
       
