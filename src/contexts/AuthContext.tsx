@@ -88,7 +88,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const { data: { session } } = await supabase.auth.getSession();
       
       if (session) {
-        await supabase.auth.signOut();
+        const { error } = await supabase.auth.signOut();
+        
+        // If there's an error, check if it's a session_not_found error
+        if (error) {
+          // Log session_not_found errors as warnings since they're expected when session is already invalid
+          if (error.message?.includes('session_not_found') || error.message?.includes('Session from session_id claim in JWT does not exist')) {
+            console.warn('Session already invalid on server, clearing local state:', error.message);
+          } else {
+            // Log other errors normally
+            console.warn('Sign out request failed, but clearing local session state:', error);
+          }
+        }
       }
     } catch (error) {
       // If signOut fails (e.g., session already invalid), we still want to clear local state
