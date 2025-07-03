@@ -128,13 +128,8 @@ class SocketManager {
   disconnect(): void {
     console.log('Déconnexion du WebSocket');
     
-    this.stopHeartbeat();
-    this.clearReconnectTimeout();
-    this.clearPendingAcks();
-    this.isConnected = false;
-    
-    if (this.channel) {
-      // Envoyer un message de déconnexion
+    // Envoyer un message de déconnexion si possible
+    if (this.isConnected && this.channel) {
       this.sendMessage({
         type: 'game_event',
         data: {
@@ -142,8 +137,18 @@ class SocketManager {
           player_id: this.playerId,
           session_id: this.sessionId
         }
+      }).catch(() => {
+        // Ignorer les erreurs lors de la déconnexion
+        console.log('Impossible d\'envoyer le message de déconnexion');
       });
+    }
 
+    this.stopHeartbeat();
+    this.clearReconnectTimeout();
+    this.clearPendingAcks();
+    this.isConnected = false;
+    
+    if (this.channel) {
       // Quitter la présence et se désabonner
       this.channel.untrack();
       this.channel.unsubscribe();
@@ -187,11 +192,8 @@ class SocketManager {
         // Ajouter à la queue si pas connecté
         this.messageQueue.push(fullMessage);
         
-        if (this.isConnected) {
-          resolve(); // Sera envoyé quand la connexion sera établie
-        } else {
-          reject(new Error('Canal non connecté'));
-        }
+        // Résoudre la promesse car le message a été mis en queue avec succès
+        resolve();
       }
     });
   }

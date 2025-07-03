@@ -107,7 +107,7 @@ export const useMatchmaking = (user: User) => {
         `)
         .eq('user_id', user.id)
         .in('room.status', ['waiting', 'starting', 'in_progress'])
-        .order('created_at', { ascending: false })
+        .order('joined_at', { ascending: false })
         .limit(1);
 
       if (existingParticipation && existingParticipation.length > 0) {

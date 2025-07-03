@@ -249,7 +249,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, fightersDa
               .from('profiles')
               .select('username, level')
               .eq('id', participant.user_id)
-              .single();
+              .maybeSingle();
 
             if (!profileError && profileData) {
               processedParticipant.profile = profileData;
