@@ -1,9 +1,8 @@
 import React, { useState } from 'react';
-import { AuthProvider } from './contexts/AuthContext';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
 import OnlineCombat from './components/OnlineCombat';
-import { useAuth } from './contexts/AuthContext';
 
-// Composant d'authentification simple intégré
+// Composant d'authentification simple temporaire
 const SimpleAuth: React.FC = () => {
   const { signIn, signUp, loading } = useAuth();
   const [isLogin, setIsLogin] = useState(true);
@@ -102,10 +101,10 @@ const SimpleAuth: React.FC = () => {
   );
 };
 
-// Composant principal du jeu
+// Composant principal du jeu COMPLET
 const GameApp: React.FC = () => {
-  const { user, loading } = useAuth();
-  const [currentView, setCurrentView] = useState<'menu' | 'online'>('menu');
+  const { user, loading, signOut } = useAuth();
+  const [currentView, setCurrentView] = useState<'menu' | 'character' | 'game' | 'online' | 'settings'>('menu');
 
   if (loading) {
     return (
@@ -123,6 +122,110 @@ const GameApp: React.FC = () => {
     return <OnlineCombat onBack={() => setCurrentView('menu')} />;
   }
 
+  if (currentView === 'character') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white p-8">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center justify-between mb-8">
+            <button
+              onClick={() => setCurrentView('menu')}
+              className="flex items-center space-x-2 text-gray-300 hover:text-white transition-colors"
+            >
+              <span>← Retour au Menu</span>
+            </button>
+            <h1 className="text-4xl font-bold">Création de Personnage</h1>
+            <div className="w-32"></div>
+          </div>
+          
+          <div className="text-center py-20">
+            <h2 className="text-3xl font-bold mb-4">Création de Personnage</h2>
+            <p className="text-xl text-gray-300 mb-8">Cette fonctionnalité sera bientôt disponible</p>
+            <button
+              onClick={() => setCurrentView('menu')}
+              className="bg-red-600 hover:bg-red-700 px-8 py-3 rounded-lg font-semibold transition-colors"
+            >
+              Retour au Menu
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (currentView === 'game') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white p-8">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center justify-between mb-8">
+            <button
+              onClick={() => setCurrentView('menu')}
+              className="flex items-center space-x-2 text-gray-300 hover:text-white transition-colors"
+            >
+              <span>← Retour au Menu</span>
+            </button>
+            <h1 className="text-4xl font-bold">Combat Solo</h1>
+            <div className="w-32"></div>
+          </div>
+          
+          <div className="text-center py-20">
+            <h2 className="text-3xl font-bold mb-4">Combat Solo</h2>
+            <p className="text-xl text-gray-300 mb-8">Cette fonctionnalité sera bientôt disponible</p>
+            <button
+              onClick={() => setCurrentView('menu')}
+              className="bg-red-600 hover:bg-red-700 px-8 py-3 rounded-lg font-semibold transition-colors"
+            >
+              Retour au Menu
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (currentView === 'settings') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white p-8">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center justify-between mb-8">
+            <button
+              onClick={() => setCurrentView('menu')}
+              className="flex items-center space-x-2 text-gray-300 hover:text-white transition-colors"
+            >
+              <span>← Retour au Menu</span>
+            </button>
+            <h1 className="text-4xl font-bold">Paramètres</h1>
+            <div className="w-32"></div>
+          </div>
+          
+          <div className="bg-gray-800 rounded-lg p-6 max-w-md mx-auto">
+            <h2 className="text-2xl font-bold mb-6 text-center">Paramètres</h2>
+            
+            <div className="space-y-4">
+              <div className="text-center">
+                <p className="text-gray-300 mb-4">Connecté en tant que: <span className="font-semibold">{user.email}</span></p>
+              </div>
+              
+              <button
+                onClick={signOut}
+                className="w-full bg-red-600 hover:bg-red-700 py-3 rounded-lg font-semibold transition-colors"
+              >
+                Se Déconnecter
+              </button>
+              
+              <button
+                onClick={() => setCurrentView('menu')}
+                className="w-full bg-gray-600 hover:bg-gray-700 py-3 rounded-lg font-semibold transition-colors"
+              >
+                Retour au Menu
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Menu principal - TON CODE ORIGINAL RESTAURÉ
   return (
     <div className="min-h-screen bg-gradient-to-br from-red-900 via-gray-900 to-black text-white">
       <div className="container mx-auto px-4 py-8">
@@ -133,10 +236,35 @@ const GameApp: React.FC = () => {
           <p className="text-xl text-gray-300">
             Un jeu de stratégie épique dans un monde de fantasy sombre
           </p>
+          <div className="mt-4">
+            <p className="text-sm text-gray-400">Connecté: {user.email}</p>
+          </div>
         </div>
 
         <div className="max-w-2xl mx-auto">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <button
+              onClick={() => setCurrentView('character')}
+              className="bg-gradient-to-r from-purple-600 to-purple-800 hover:from-purple-700 hover:to-purple-900 p-8 rounded-lg shadow-lg transition-all duration-300 transform hover:scale-105"
+            >
+              <div className="text-4xl mb-4">👤</div>
+              <h2 className="text-2xl font-bold mb-2">Création de Personnage</h2>
+              <p className="text-gray-300">
+                Créez votre héros et définissez ses capacités
+              </p>
+            </button>
+
+            <button
+              onClick={() => setCurrentView('game')}
+              className="bg-gradient-to-r from-green-600 to-green-800 hover:from-green-700 hover:to-green-900 p-8 rounded-lg shadow-lg transition-all duration-300 transform hover:scale-105"
+            >
+              <div className="text-4xl mb-4">⚔️</div>
+              <h2 className="text-2xl font-bold mb-2">Combat Solo</h2>
+              <p className="text-gray-300">
+                Affrontez des ennemis en mode solo
+              </p>
+            </button>
+
             <button
               onClick={() => setCurrentView('online')}
               className="bg-gradient-to-r from-red-600 to-red-800 hover:from-red-700 hover:to-red-900 p-8 rounded-lg shadow-lg transition-all duration-300 transform hover:scale-105"
@@ -149,15 +277,13 @@ const GameApp: React.FC = () => {
             </button>
 
             <button
-              onClick={() => {
-                console.log('Autres modes à venir...');
-              }}
+              onClick={() => setCurrentView('settings')}
               className="bg-gradient-to-r from-gray-600 to-gray-800 hover:from-gray-700 hover:to-gray-900 p-8 rounded-lg shadow-lg transition-all duration-300 transform hover:scale-105"
             >
-              <div className="text-4xl mb-4">⚔️</div>
-              <h2 className="text-2xl font-bold mb-2">Autres Modes</h2>
+              <div className="text-4xl mb-4">⚙️</div>
+              <h2 className="text-2xl font-bold mb-2">Paramètres</h2>
               <p className="text-gray-300">
-                Bientôt disponible...
+                Configurez votre expérience de jeu
               </p>
             </button>
           </div>
@@ -167,7 +293,7 @@ const GameApp: React.FC = () => {
   );
 };
 
-// Composant App principal
+// Composant App principal avec AuthProvider
 const App: React.FC = () => {
   return (
     <AuthProvider>
