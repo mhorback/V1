@@ -2,12 +2,15 @@ import { GameState, GameAction, PlayerState, GameCard, Fighter, CombatLogEntry }
 import { useGameStore } from '../stores/gameStore';
 import { StateSync } from './stateSync';
 import { socketManager } from './socketManager';
+import { v4 as uuidv4 } from 'uuid';
 
 export class GameEngine {
-  private static readonly INITIAL_HAND_SIZE = 8;
+  private static readonly INITIAL_HAND_SIZE = 5;
   private static readonly CARDS_PER_TURN = 1;
   private static readonly MAX_FIELD_SIZE = 5;
   private static readonly TURN_TIME_LIMIT = 120000; // 2 minutes
+  private static readonly INITIAL_HP = 100;
+  private static readonly INITIAL_ENERGY = 3;
 
   // Initialiser une nouvelle partie
   static initializeGame(roomId: string, player1: PlayerState, player2: PlayerState): GameState {
@@ -18,15 +21,15 @@ export class GameEngine {
       current_player: 1,
       player1: {
         ...player1,
-        hp: 100,
-        max_hp: 100,
+        hp: this.INITIAL_HP,
+        max_hp: this.INITIAL_HP,
         hand: [],
         field: [],
         bench: [],
         graveyard: [],
         active_fighter: null,
-        energy: 3,
-        max_energy: 3,
+        energy: this.INITIAL_ENERGY,
+        max_energy: this.INITIAL_ENERGY,
         cards_drawn_this_turn: 0,
         actions_remaining: 1,
         is_ready: false,
@@ -35,15 +38,15 @@ export class GameEngine {
       },
       player2: {
         ...player2,
-        hp: 100,
-        max_hp: 100,
+        hp: this.INITIAL_HP,
+        max_hp: this.INITIAL_HP,
         hand: [],
         field: [],
         bench: [],
         graveyard: [],
         active_fighter: null,
-        energy: 3,
-        max_energy: 3,
+        energy: this.INITIAL_ENERGY,
+        max_energy: this.INITIAL_ENERGY,
         cards_drawn_this_turn: 0,
         actions_remaining: 1,
         is_ready: false,
@@ -86,7 +89,7 @@ export class GameEngine {
       description: `Les joueurs ont pioché ${this.INITIAL_HAND_SIZE} cartes`
     });
 
-    newState.current_phase = 'main';
+    newState.current_phase = 'draw';
     newState.state_hash = StateSync.generateStateHash(newState);
 
     return newState;
@@ -153,34 +156,42 @@ export class GameEngine {
     
     // Vérifications de base
     if (action.player_id !== currentPlayer.user_id) {
-      return false; // Pas le tour du joueur
+      console.log('Pas le tour du joueur');
+      return false;
     }
 
     if (action.turn_number !== gameState.turn_number) {
-      return false; // Numéro de tour incorrect
+      console.log('Numéro de tour incorrect');
+      return false;
     }
 
     // Vérifications spécifiques par type d'action
     switch (action.action_type) {
       case 'draw_card':
         return gameState.current_phase === 'draw' && 
-               currentPlayer.cards_drawn_this_turn < this.CARDS_PER_TURN;
+               currentPlayer.cards_drawn_this_turn < this.CARDS_PER_TURN &&
+               currentPlayer.bench.length > 0;
 
       case 'summon_fighter':
+        const cardInHand = currentPlayer.hand.find(c => c.id === action.action_data.card_id);
         return gameState.current_phase === 'main' && 
                currentPlayer.actions_remaining > 0 &&
-               currentPlayer.hand.length > 0 &&
-               currentPlayer.field.length < this.MAX_FIELD_SIZE;
+               cardInHand !== undefined &&
+               currentPlayer.field.length < this.MAX_FIELD_SIZE &&
+               currentPlayer.energy >= this.getCardCost(cardInHand);
 
       case 'attack':
+        const attacker = currentPlayer.field.find(c => c.id === action.action_data.attacker_id);
         return gameState.current_phase === 'combat' && 
-               this.canAttack(action.action_data.attacker_id, gameState);
+               attacker !== undefined &&
+               attacker.can_attack &&
+               !attacker.summoned_this_turn;
 
       case 'end_turn':
-        return currentPlayer.actions_remaining >= 0;
+        return true; // Toujours possible de finir son tour
 
       case 'surrender':
-        return true; // Toujours possible
+        return true; // Toujours possible d'abandonner
 
       default:
         return false;
@@ -224,6 +235,9 @@ export class GameEngine {
         player_id: currentPlayer.user_id,
         description: `${currentPlayer.username} ne peut plus piocher de cartes`
       });
+      
+      // Passer directement à la phase principale
+      gameState.current_phase = 'main';
       return gameState;
     }
 
@@ -235,7 +249,7 @@ export class GameEngine {
     this.addCombatLog(gameState, {
       type: 'draw',
       player_id: currentPlayer.user_id,
-      description: `${currentPlayer.username} a pioché une carte`
+      description: `${currentPlayer.username} a pioché ${drawnCard.fighter.name}`
     });
 
     // Passer à la phase principale
@@ -254,7 +268,14 @@ export class GameEngine {
     if (cardIndex === -1) return gameState;
 
     const card = currentPlayer.hand[cardIndex];
-    
+    const cost = this.getCardCost(card);
+
+    // Vérifier l'énergie
+    if (currentPlayer.energy < cost) {
+      console.error('Pas assez d\'énergie pour invoquer cette carte');
+      return gameState;
+    }
+
     // Retirer de la main et ajouter au terrain
     currentPlayer.hand.splice(cardIndex, 1);
     card.position = 'field';
@@ -262,14 +283,28 @@ export class GameEngine {
     card.can_attack = false;
     currentPlayer.field.push(card);
 
+    // Consommer l'énergie
+    currentPlayer.energy -= cost;
     currentPlayer.actions_remaining--;
 
     this.addCombatLog(gameState, {
       type: 'summon',
       player_id: currentPlayer.user_id,
       source: card.fighter.name,
-      description: `${currentPlayer.username} a invoqué ${card.fighter.name}`
+      description: `${currentPlayer.username} a invoqué ${card.fighter.name} (coût: ${cost} énergie)`
     });
+
+    // Passer à la phase de combat si plus d'actions
+    if (currentPlayer.actions_remaining <= 0) {
+      gameState.current_phase = 'combat';
+      
+      // Permettre aux combattants d'attaquer (sauf ceux invoqués ce tour)
+      currentPlayer.field.forEach(fieldCard => {
+        if (!fieldCard.summoned_this_turn) {
+          fieldCard.can_attack = true;
+        }
+      });
+    }
 
     gameState.state_hash = StateSync.generateStateHash(gameState);
     return gameState;
@@ -292,8 +327,19 @@ export class GameEngine {
       const target = opponent.field.find(card => card.id === target_id);
       if (!target) return gameState;
 
-      target.fighter.current_hp = (target.fighter.current_hp || target.fighter.pv) - damage;
+      // Calculer les dégâts avec l'endurance
+      const actualDamage = Math.max(1, damage - target.fighter.endurance);
+      target.fighter.current_hp = (target.fighter.current_hp || target.fighter.pv) - actualDamage;
       targetName = target.fighter.name;
+
+      this.addCombatLog(gameState, {
+        type: 'damage',
+        player_id: currentPlayer.user_id,
+        source: attacker.fighter.name,
+        target: target.fighter.name,
+        value: actualDamage,
+        description: `${attacker.fighter.name} inflige ${actualDamage} dégâts à ${target.fighter.name} (${damage} - ${target.fighter.endurance} endurance)`
+      });
 
       // Vérifier si le combattant est détruit
       if (target.fighter.current_hp <= 0) {
@@ -307,21 +353,47 @@ export class GameEngine {
           player_id: currentPlayer.user_id,
           source: attacker.fighter.name,
           target: target.fighter.name,
-          value: damage,
-          description: `${attacker.fighter.name} a détruit ${target.fighter.name}`
-        });
-      } else {
-        this.addCombatLog(gameState, {
-          type: 'damage',
-          player_id: currentPlayer.user_id,
-          source: attacker.fighter.name,
-          target: target.fighter.name,
-          value: damage,
-          description: `${attacker.fighter.name} inflige ${damage} dégâts à ${target.fighter.name}`
+          description: `${target.fighter.name} a été détruit !`
         });
       }
+
+      // Contre-attaque si le défenseur survit
+      if (target.fighter.current_hp > 0 && target.can_attack) {
+        const counterDamage = Math.max(1, target.fighter.force - attacker.fighter.endurance);
+        attacker.fighter.current_hp = (attacker.fighter.current_hp || attacker.fighter.pv) - counterDamage;
+
+        this.addCombatLog(gameState, {
+          type: 'damage',
+          player_id: opponent.user_id,
+          source: target.fighter.name,
+          target: attacker.fighter.name,
+          value: counterDamage,
+          description: `${target.fighter.name} contre-attaque et inflige ${counterDamage} dégâts à ${attacker.fighter.name}`
+        });
+
+        // Vérifier si l'attaquant est détruit
+        if (attacker.fighter.current_hp <= 0) {
+          const attackerIndex = currentPlayer.field.findIndex(card => card.id === attacker_id);
+          currentPlayer.field.splice(attackerIndex, 1);
+          attacker.position = 'graveyard';
+          currentPlayer.graveyard.push(attacker);
+
+          this.addCombatLog(gameState, {
+            type: 'damage',
+            player_id: opponent.user_id,
+            source: target.fighter.name,
+            target: attacker.fighter.name,
+            description: `${attacker.fighter.name} a été détruit par la contre-attaque !`
+          });
+        }
+      }
     } else {
-      // Attaque directe
+      // Attaque directe (seulement si l'adversaire n'a pas de combattants)
+      if (opponent.field.length > 0) {
+        console.error('Impossible d\'attaquer directement avec des combattants sur le terrain adverse');
+        return gameState;
+      }
+
       opponent.hp -= damage;
       targetName = opponent.username;
 
@@ -331,14 +403,14 @@ export class GameEngine {
         source: attacker.fighter.name,
         target: opponent.username,
         value: damage,
-        description: `${attacker.fighter.name} inflige ${damage} dégâts à ${opponent.username}`
+        description: `${attacker.fighter.name} inflige ${damage} dégâts directement à ${opponent.username}`
       });
 
       // Vérifier la victoire
       if (opponent.hp <= 0) {
         gameState.current_phase = 'finished';
         this.addCombatLog(gameState, {
-          type: 'damage',
+          type: 'phase_change',
           player_id: 'system',
           description: `${currentPlayer.username} remporte la partie !`
         });
@@ -351,6 +423,8 @@ export class GameEngine {
   }
 
   private static applyEndTurn(action: GameAction, gameState: GameState): GameState {
+    const currentPlayer = gameState.current_player === 1 ? gameState.player1 : gameState.player2;
+    
     // Changer de joueur
     gameState.current_player = gameState.current_player === 1 ? 2 : 1;
     gameState.turn_number++;
@@ -361,7 +435,12 @@ export class GameEngine {
     const newCurrentPlayer = gameState.current_player === 1 ? gameState.player1 : gameState.player2;
     newCurrentPlayer.cards_drawn_this_turn = 0;
     newCurrentPlayer.actions_remaining = 1;
-    newCurrentPlayer.energy = Math.min(newCurrentPlayer.max_energy, newCurrentPlayer.energy + 1);
+    
+    // Augmenter l'énergie maximale et restaurer l'énergie
+    if (newCurrentPlayer.max_energy < 10) {
+      newCurrentPlayer.max_energy++;
+    }
+    newCurrentPlayer.energy = newCurrentPlayer.max_energy;
 
     // Permettre aux combattants d'attaquer (sauf ceux invoqués ce tour)
     newCurrentPlayer.field.forEach(card => {
@@ -369,6 +448,11 @@ export class GameEngine {
         card.can_attack = true;
       }
       card.summoned_this_turn = false;
+    });
+
+    // Réinitialiser les états de l'ancien joueur
+    currentPlayer.field.forEach(card => {
+      card.can_attack = false;
     });
 
     this.addCombatLog(gameState, {
@@ -402,7 +486,31 @@ export class GameEngine {
     const currentPlayer = gameState.current_player === 1 ? gameState.player1 : gameState.player2;
     const attacker = currentPlayer.field.find(card => card.id === attackerId);
     
-    return attacker ? attacker.can_attack : false;
+    return attacker ? attacker.can_attack && !attacker.summoned_this_turn : false;
+  }
+
+  private static getCardCost(card: GameCard): number {
+    // Calculer le coût basé sur la rareté et les stats
+    const baseStats = card.fighter.force + card.fighter.pv + card.fighter.endurance + card.fighter.vitesse;
+    let cost = Math.floor(baseStats / 50);
+
+    // Ajustement par rareté
+    switch (card.fighter.rarity) {
+      case 'Commune':
+        cost = Math.max(1, cost - 1);
+        break;
+      case 'Rare':
+        cost = Math.max(2, cost);
+        break;
+      case 'Épique':
+        cost = Math.max(3, cost + 1);
+        break;
+      case 'Légendaire':
+        cost = Math.max(4, cost + 2);
+        break;
+    }
+
+    return Math.min(10, cost); // Maximum 10 d'énergie
   }
 
   private static shuffleDeck(deck: Fighter[]): Fighter[] {
@@ -416,7 +524,7 @@ export class GameEngine {
 
   private static createGameCard(fighter: Fighter): GameCard {
     return {
-      id: `card_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: uuidv4(),
       fighter: {
         ...fighter,
         current_hp: fighter.pv
@@ -429,7 +537,7 @@ export class GameEngine {
 
   private static addCombatLog(gameState: GameState, entry: Omit<CombatLogEntry, 'id' | 'timestamp'>) {
     const logEntry: CombatLogEntry = {
-      id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: uuidv4(),
       timestamp: Date.now(),
       ...entry
     };
@@ -451,7 +559,6 @@ export class GameEngine {
     if (actionIndex === -1) return;
 
     // Reconstruire l'état en rejouant toutes les actions jusqu'à ce point
-    // Cette implémentation nécessiterait un état initial sauvegardé
     console.log('Rollback vers action:', actionId);
     
     // Pour l'instant, on demande une synchronisation complète
@@ -473,7 +580,7 @@ export class GameEngine {
     }
 
     return {
-      id: `action_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: uuidv4(),
       room_id: roomId,
       player_id: playerId,
       action_type: actionType,
@@ -483,5 +590,69 @@ export class GameEngine {
       sequence_number: store.actionHistory.length + 1,
       state_hash_before: gameState.state_hash
     };
+  }
+
+  // Vérifier les conditions de victoire
+  static checkWinConditions(gameState: GameState): string | null {
+    if (gameState.player1.hp <= 0) {
+      return gameState.player2.username;
+    }
+    if (gameState.player2.hp <= 0) {
+      return gameState.player1.username;
+    }
+    
+    // Victoire par deck vide (optionnel)
+    if (gameState.player1.hand.length === 0 && gameState.player1.bench.length === 0) {
+      return gameState.player2.username;
+    }
+    if (gameState.player2.hand.length === 0 && gameState.player2.bench.length === 0) {
+      return gameState.player1.username;
+    }
+    
+    return null;
+  }
+
+  // Obtenir les actions possibles pour un joueur
+  static getPossibleActions(gameState: GameState, playerId: string): string[] {
+    const currentPlayer = gameState.current_player === 1 ? gameState.player1 : gameState.player2;
+    
+    if (currentPlayer.user_id !== playerId) {
+      return []; // Pas le tour du joueur
+    }
+
+    const actions: string[] = [];
+
+    switch (gameState.current_phase) {
+      case 'draw':
+        if (currentPlayer.cards_drawn_this_turn < this.CARDS_PER_TURN && currentPlayer.bench.length > 0) {
+          actions.push('draw_card');
+        }
+        break;
+
+      case 'main':
+        if (currentPlayer.actions_remaining > 0) {
+          // Vérifier quelles cartes peuvent être invoquées
+          currentPlayer.hand.forEach(card => {
+            if (currentPlayer.energy >= this.getCardCost(card) && currentPlayer.field.length < this.MAX_FIELD_SIZE) {
+              actions.push(`summon_fighter:${card.id}`);
+            }
+          });
+        }
+        break;
+
+      case 'combat':
+        // Vérifier quels combattants peuvent attaquer
+        currentPlayer.field.forEach(card => {
+          if (card.can_attack && !card.summoned_this_turn) {
+            actions.push(`attack:${card.id}`);
+          }
+        });
+        break;
+    }
+
+    // Toujours possible de finir son tour ou abandonner
+    actions.push('end_turn', 'surrender');
+
+    return actions;
   }
 }
