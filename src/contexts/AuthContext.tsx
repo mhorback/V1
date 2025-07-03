@@ -84,7 +84,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signOut = async () => {
     try {
-      await supabase.auth.signOut();
+      // Check if there's an active session before attempting to sign out
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (session) {
+        await supabase.auth.signOut();
+      }
     } catch (error) {
       // If signOut fails (e.g., session already invalid), we still want to clear local state
       console.warn('Sign out request failed, but clearing local session state:', error);
