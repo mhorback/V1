@@ -454,8 +454,12 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
                             </div>
                           )}
                           <div>
-                            <p className="text-white font-bold">{player.profile.username}</p>
-                            <p className="text-gray-300 text-sm">Niveau {player.profile.level}</p>
+                            <p className="text-white font-bold">
+                              {player.profile?.username || 'Utilisateur inconnu'}
+                            </p>
+                            <p className="text-gray-300 text-sm">
+                              Niveau {player.profile?.level || 'N/A'}
+                            </p>
                           </div>
                         </div>
                         <div className={`px-3 py-1 rounded text-sm font-bold ${
