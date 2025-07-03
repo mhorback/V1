@@ -83,7 +83,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+    } catch (error) {
+      // If signOut fails (e.g., session already invalid), we still want to clear local state
+      console.warn('Sign out request failed, but clearing local session state:', error);
+    } finally {
+      // Always clear the local state regardless of server response
+      setSession(null);
+      setUser(null);
+    }
   };
 
   const value = {
