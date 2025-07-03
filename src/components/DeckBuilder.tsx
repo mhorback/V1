@@ -299,7 +299,31 @@ const DeckBuilder: React.FC<DeckBuilderProps> = ({
   const deleteDeck = async (deckId: number) => {
     if (!confirm('Êtes-vous sûr de vouloir supprimer ce deck ?')) return;
 
+    setLoading(true);
+    setError(null);
+
     try {
+      // Vérifier si le deck est utilisé dans une room active
+      const { data: roomParticipants, error: checkError } = await supabase
+        .from('room_participants')
+        .select(`
+          id,
+          deck_id,
+          status,
+          game_rooms!inner(status)
+        `)
+        .eq('deck_id', deckId)
+        .in('status', ['connected', 'ready', 'playing'])
+        .in('game_rooms.status', ['waiting', 'starting', 'in_progress']);
+
+      if (checkError) throw checkError;
+
+      if (roomParticipants && roomParticipants.length > 0) {
+        setError('Impossible de supprimer ce deck : il est actuellement utilisé dans une partie en cours ou en attente. Veuillez d\'abord quitter la partie ou attendre qu\'elle se termine.');
+        return;
+      }
+
+      // Si le deck n'est pas utilisé, procéder à la suppression
       const { error } = await supabase
         .from('user_decks')
         .delete()
@@ -312,8 +336,15 @@ const DeckBuilder: React.FC<DeckBuilderProps> = ({
       if (editingDeckId === deckId) {
         newDeck();
       }
+      setSuccess('Deck supprimé avec succès !');
+      setTimeout(() => {
+        setSuccess(null);
+      }, 3000);
+
     } catch (err: any) {
       setError(err.message || 'Erreur lors de la suppression');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -709,7 +740,8 @@ const DeckBuilder: React.FC<DeckBuilderProps> = ({
                       </button>
                       <button
                         onClick={() => deleteDeck(deck.id!)}
-                        className="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-sm flex items-center justify-center"
+                        disabled={loading}
+                        className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white px-3 py-1 rounded text-sm flex items-center justify-center"
                         title="Supprimer"
                       >
                         <Trash2 className="w-3 h-3" />
