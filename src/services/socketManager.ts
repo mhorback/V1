@@ -1,8 +1,10 @@
 import { WebSocketMessage, ConnectionState } from '../types/game';
 import { useGameStore } from '../stores/gameStore';
+import { supabase } from '../lib/supabase';
+import { RealtimeChannel } from '@supabase/supabase-js';
 
 class SocketManager {
-  private ws: WebSocket | null = null;
+  private channel: RealtimeChannel | null = null;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private messageQueue: WebSocketMessage[] = [];
@@ -16,79 +18,136 @@ class SocketManager {
   private roomId: string = '';
   private playerId: string = '';
   private sessionId: string = '';
+  private isConnected: boolean = false;
 
   constructor() {
     this.sessionId = this.generateSessionId();
   }
 
-  // Connexion WebSocket
+  // Connexion via Supabase Realtime
   connect(roomId: string, playerId: string): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
         this.roomId = roomId;
         this.playerId = playerId;
 
-        // URL WebSocket (utilise Supabase Realtime ou un serveur WebSocket dédié)
-        const wsUrl = `${import.meta.env.VITE_SUPABASE_URL?.replace('https://', 'wss://')}/realtime/v1/websocket?apikey=${import.meta.env.VITE_SUPABASE_ANON_KEY}&vsn=1.0.0`;
-        
-        this.ws = new WebSocket(wsUrl);
+        // Nettoyer l'ancienne connexion
+        if (this.channel) {
+          this.disconnect();
+        }
 
-        this.ws.onopen = () => {
-          console.log('WebSocket connecté');
-          this.updateConnectionState({
-            status: 'connected',
-            reconnect_attempts: 0,
-            session_id: this.sessionId
+        console.log(`Connexion à la room ${roomId} pour le joueur ${playerId}`);
+
+        // Créer un canal Supabase Realtime pour la room
+        this.channel = supabase.channel(`game_room_${roomId}`, {
+          config: {
+            broadcast: { self: true },
+            presence: { key: playerId }
+          }
+        });
+
+        // Écouter les événements de connexion
+        this.channel
+          .on('presence', { event: 'sync' }, () => {
+            console.log('Présence synchronisée');
+            this.updateConnectionState({
+              status: 'connected',
+              reconnect_attempts: 0,
+              session_id: this.sessionId
+            });
+            this.isConnected = true;
+            this.startHeartbeat();
+            this.processMessageQueue();
+            resolve();
+          })
+          .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+            console.log('Joueur rejoint:', key, newPresences);
+            this.handlePlayerJoin(key, newPresences);
+          })
+          .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+            console.log('Joueur parti:', key, leftPresences);
+            this.handlePlayerLeave(key, leftPresences);
+          })
+          .on('broadcast', { event: 'game_message' }, ({ payload }) => {
+            console.log('Message reçu:', payload);
+            this.handleMessage(payload as WebSocketMessage);
+          })
+          .on('broadcast', { event: 'heartbeat' }, ({ payload }) => {
+            this.handleHeartbeat(payload);
+          })
+          .on('broadcast', { event: 'ack' }, ({ payload }) => {
+            this.handleAck(payload.message_id);
           });
 
-          this.startHeartbeat();
-          this.processMessageQueue();
+        // S'abonner au canal
+        this.channel.subscribe(async (status) => {
+          console.log('Statut de subscription:', status);
           
-          // Rejoindre la room
-          this.joinRoom();
-          resolve();
-        };
-
-        this.ws.onmessage = (event) => {
-          try {
-            const message: WebSocketMessage = JSON.parse(event.data);
-            this.handleMessage(message);
-          } catch (error) {
-            console.error('Erreur parsing message WebSocket:', error);
-          }
-        };
-
-        this.ws.onclose = (event) => {
-          console.log('WebSocket fermé:', event.code, event.reason);
-          this.updateConnectionState({ status: 'disconnected' });
-          this.stopHeartbeat();
-          
-          if (event.code !== 1000) { // Pas une fermeture normale
+          if (status === 'SUBSCRIBED') {
+            // Rejoindre la présence
+            await this.channel?.track({
+              user_id: playerId,
+              session_id: this.sessionId,
+              joined_at: new Date().toISOString()
+            });
+            
+            // Envoyer un message de connexion
+            this.sendMessage({
+              type: 'game_event',
+              data: {
+                event: 'player_connected',
+                player_id: playerId,
+                session_id: this.sessionId
+              }
+            });
+          } else if (status === 'CHANNEL_ERROR') {
+            console.error('Erreur de canal');
+            this.updateConnectionState({ status: 'error' });
+            reject(new Error('Erreur de connexion au canal'));
+          } else if (status === 'TIMED_OUT') {
+            console.error('Timeout de connexion');
+            this.updateConnectionState({ status: 'error' });
+            this.attemptReconnect();
+          } else if (status === 'CLOSED') {
+            console.log('Canal fermé');
+            this.updateConnectionState({ status: 'disconnected' });
+            this.isConnected = false;
+            this.stopHeartbeat();
             this.attemptReconnect();
           }
-        };
-
-        this.ws.onerror = (error) => {
-          console.error('Erreur WebSocket:', error);
-          this.updateConnectionState({ status: 'error' });
-          reject(error);
-        };
+        });
 
       } catch (error) {
+        console.error('Erreur lors de la connexion:', error);
         reject(error);
       }
     });
   }
 
   // Déconnexion
-  disconnect() {
+  disconnect(): void {
+    console.log('Déconnexion du WebSocket');
+    
     this.stopHeartbeat();
     this.clearReconnectTimeout();
     this.clearPendingAcks();
+    this.isConnected = false;
     
-    if (this.ws) {
-      this.ws.close(1000, 'Déconnexion volontaire');
-      this.ws = null;
+    if (this.channel) {
+      // Envoyer un message de déconnexion
+      this.sendMessage({
+        type: 'game_event',
+        data: {
+          event: 'player_disconnected',
+          player_id: this.playerId,
+          session_id: this.sessionId
+        }
+      });
+
+      // Quitter la présence et se désabonner
+      this.channel.untrack();
+      this.channel.unsubscribe();
+      this.channel = null;
     }
 
     this.updateConnectionState({ status: 'disconnected' });
@@ -105,8 +164,13 @@ class SocketManager {
         player_id: this.playerId
       };
 
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(fullMessage));
+      if (this.isConnected && this.channel) {
+        // Envoyer via broadcast
+        this.channel.send({
+          type: 'broadcast',
+          event: 'game_message',
+          payload: fullMessage
+        });
 
         // Gérer les accusés de réception
         if (fullMessage.requires_ack) {
@@ -123,24 +187,25 @@ class SocketManager {
         // Ajouter à la queue si pas connecté
         this.messageQueue.push(fullMessage);
         
-        if (this.ws?.readyState === WebSocket.CONNECTING) {
+        if (this.isConnected) {
           resolve(); // Sera envoyé quand la connexion sera établie
         } else {
-          reject(new Error('WebSocket non connecté'));
+          reject(new Error('Canal non connecté'));
         }
       }
     });
   }
 
   // Gestion des messages reçus
-  private handleMessage(message: WebSocketMessage) {
+  private handleMessage(message: WebSocketMessage): void {
     const store = useGameStore.getState();
 
-    switch (message.type) {
-      case 'heartbeat':
-        this.handleHeartbeat(message);
-        break;
+    // Ignorer nos propres messages
+    if (message.player_id === this.playerId) {
+      return;
+    }
 
+    switch (message.type) {
       case 'action':
         this.handleGameAction(message);
         break;
@@ -171,32 +236,61 @@ class SocketManager {
     }
   }
 
+  // Gestion des joueurs
+  private handlePlayerJoin(playerId: string, presences: any[]): void {
+    console.log(`Joueur ${playerId} a rejoint la partie`);
+    
+    // Notifier le store
+    const store = useGameStore.getState();
+    // Ici on pourrait mettre à jour l'état des joueurs connectés
+  }
+
+  private handlePlayerLeave(playerId: string, presences: any[]): void {
+    console.log(`Joueur ${playerId} a quitté la partie`);
+    
+    // Gérer la déconnexion d'un joueur
+    this.sendMessage({
+      type: 'game_event',
+      data: {
+        event: 'player_disconnected',
+        player_id: playerId,
+        timestamp: Date.now()
+      }
+    });
+  }
+
   // Heartbeat
-  private startHeartbeat() {
+  private startHeartbeat(): void {
     this.heartbeatInterval = setInterval(() => {
       const now = Date.now();
       
-      this.sendMessage({
-        type: 'heartbeat',
-        data: { timestamp: now }
-      }).catch(() => {
-        console.warn('Échec envoi heartbeat');
-      });
+      if (this.channel) {
+        this.channel.send({
+          type: 'broadcast',
+          event: 'heartbeat',
+          payload: { 
+            player_id: this.playerId,
+            timestamp: now 
+          }
+        });
+      }
 
       this.updateConnectionState({ last_heartbeat: now });
     }, this.HEARTBEAT_INTERVAL);
   }
 
-  private stopHeartbeat() {
+  private stopHeartbeat(): void {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
   }
 
-  private handleHeartbeat(message: WebSocketMessage) {
+  private handleHeartbeat(payload: any): void {
+    if (payload.player_id === this.playerId) return; // Ignorer notre propre heartbeat
+    
     const now = Date.now();
-    const ping = now - message.data.timestamp;
+    const ping = now - payload.timestamp;
     
     this.updateConnectionState({ 
       ping,
@@ -205,7 +299,7 @@ class SocketManager {
   }
 
   // Reconnexion automatique
-  private attemptReconnect() {
+  private attemptReconnect(): void {
     const store = useGameStore.getState();
     
     if (store.connection.reconnect_attempts >= this.MAX_RECONNECT_ATTEMPTS) {
@@ -234,7 +328,7 @@ class SocketManager {
     }, this.RECONNECT_DELAY);
   }
 
-  private clearReconnectTimeout() {
+  private clearReconnectTimeout(): void {
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -242,7 +336,7 @@ class SocketManager {
   }
 
   // Gestion des actions de jeu
-  private handleGameAction(message: WebSocketMessage) {
+  private handleGameAction(message: WebSocketMessage): void {
     // Déléguer au gameEngine
     import('./gameEngine').then(({ GameEngine }) => {
       GameEngine.processRemoteAction(message.data);
@@ -250,13 +344,13 @@ class SocketManager {
   }
 
   // Synchronisation d'état
-  private handleStateSync(message: WebSocketMessage) {
+  private handleStateSync(message: WebSocketMessage): void {
     import('./stateSync').then(({ StateSync }) => {
       StateSync.handleServerSync(message.data);
     });
   }
 
-  private requestStateSync() {
+  private requestStateSync(): void {
     this.sendMessage({
       type: 'state_sync',
       data: { 
@@ -267,7 +361,7 @@ class SocketManager {
   }
 
   // Événements de jeu
-  private handleGameEvent(message: WebSocketMessage) {
+  private handleGameEvent(message: WebSocketMessage): void {
     const store = useGameStore.getState();
     
     switch (message.data.event) {
@@ -287,11 +381,15 @@ class SocketManager {
       case 'game_resumed':
         console.log('Jeu repris');
         break;
+
+      case 'player_connected':
+        console.log('Joueur connecté:', message.data.player_id);
+        break;
     }
   }
 
   // Gestion de la reconnexion
-  private handleReconnect(message: WebSocketMessage) {
+  private handleReconnect(message: WebSocketMessage): void {
     if (message.data.session_valid) {
       console.log('Session restaurée');
       this.requestStateSync();
@@ -301,45 +399,47 @@ class SocketManager {
     }
   }
 
-  // Rejoindre une room
-  private joinRoom() {
-    this.sendMessage({
-      type: 'game_event',
-      data: {
-        event: 'join_room',
-        room_id: this.roomId,
-        player_id: this.playerId,
-        session_id: this.sessionId
-      }
-    });
+  // Accusé de réception
+  private sendAck(messageId: string): void {
+    if (this.channel) {
+      this.channel.send({
+        type: 'broadcast',
+        event: 'ack',
+        payload: {
+          message_id: messageId,
+          timestamp: Date.now()
+        }
+      });
+    }
   }
 
-  // Accusé de réception
-  private sendAck(messageId: string) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'ack',
-        message_id: messageId,
-        timestamp: Date.now()
-      }));
+  private handleAck(messageId: string): void {
+    const timeout = this.pendingAcks.get(messageId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.pendingAcks.delete(messageId);
     }
   }
 
   // Traitement de la queue de messages
-  private processMessageQueue() {
-    while (this.messageQueue.length > 0 && this.ws?.readyState === WebSocket.OPEN) {
+  private processMessageQueue(): void {
+    while (this.messageQueue.length > 0 && this.isConnected && this.channel) {
       const message = this.messageQueue.shift()!;
-      this.ws.send(JSON.stringify(message));
+      this.channel.send({
+        type: 'broadcast',
+        event: 'game_message',
+        payload: message
+      });
     }
   }
 
   // Utilitaires
-  private updateConnectionState(updates: Partial<ConnectionState>) {
+  private updateConnectionState(updates: Partial<ConnectionState>): void {
     const store = useGameStore.getState();
     store.setConnection(updates);
   }
 
-  private clearPendingAcks() {
+  private clearPendingAcks(): void {
     this.pendingAcks.forEach(timeout => clearTimeout(timeout));
     this.pendingAcks.clear();
   }
@@ -353,8 +453,8 @@ class SocketManager {
   }
 
   // Getters
-  get isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+  get isConnectedState(): boolean {
+    return this.isConnected && this.channel !== null;
   }
 
   get connectionState(): ConnectionState {
