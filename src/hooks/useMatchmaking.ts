@@ -38,9 +38,95 @@ export const useMatchmaking = (user: any) => {
     }
   };
 
-  // Recherche directe d'un match
-  const findMatchDirect = async (gameMode: string, deckId: number, userLevel: number) => {
+  // Vérifier si l'utilisateur a déjà une salle active
+  const checkExistingRoom = async () => {
     try {
+      const { data: existingParticipation } = await supabase
+        .from('room_participants')
+        .select(`
+          room_id,
+          room:game_rooms!room_participants_room_id_fkey(*)
+        `)
+        .eq('user_id', user.id)
+        .in('room.status', ['waiting', 'starting', 'in_progress'])
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (existingParticipation && existingParticipation.length > 0) {
+        const room = existingParticipation[0].room;
+        console.log('Salle existante trouvée:', room);
+        
+        setState(prev => ({
+          ...prev,
+          status: 'match_found',
+          roomId: room.id,
+          isSearching: false
+        }));
+        
+        return true;
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Erreur vérification salle existante:', error);
+      return false;
+    }
+  };
+
+  // Recherche directe d'un match avec la fonction PostgreSQL
+  const findMatchWithFunction = async (gameMode: string, deckId: number, userLevel: number) => {
+    try {
+      console.log('Recherche de match avec fonction PostgreSQL...');
+      
+      const { data, error } = await supabase
+        .rpc('try_create_match', {
+          p_user_id: user.id,
+          p_game_mode: gameMode,
+          p_deck_id: deckId,
+          p_user_level: userLevel,
+          p_username: user.username || 'Joueur'
+        });
+
+      if (error) {
+        console.error('Erreur fonction try_create_match:', error);
+        throw error;
+      }
+
+      console.log('Résultat fonction try_create_match:', data);
+
+      if (data && data.length > 0) {
+        const result = data[0];
+        
+        if (result.status === 'match_found') {
+          return {
+            status: 'match_found',
+            room_id: result.room_id,
+            opponent: {
+              username: result.opponent_username,
+              level: result.opponent_level
+            }
+          };
+        } else {
+          return {
+            status: 'searching',
+            queue_id: result.queue_id
+          };
+        }
+      }
+
+      // Fallback si la fonction ne retourne rien
+      return await findMatchFallback(gameMode, deckId, userLevel);
+    } catch (error) {
+      console.error('Erreur fonction PostgreSQL, utilisation du fallback:', error);
+      return await findMatchFallback(gameMode, deckId, userLevel);
+    }
+  };
+
+  // Fallback pour la recherche de match
+  const findMatchFallback = async (gameMode: string, deckId: number, userLevel: number) => {
+    try {
+      console.log('Utilisation du fallback pour la recherche de match...');
+      
       // Nettoyer d'abord
       await cleanupOldQueueEntries();
 
@@ -63,94 +149,89 @@ export const useMatchmaking = (user: any) => {
         .limit(1);
 
       if (potentialOpponents && potentialOpponents.length > 0) {
-        // Match trouvé ! Essayer de créer une salle
         const opponent = potentialOpponents[0];
         
-        try {
-          // Vérifier que l'adversaire est toujours disponible
-          const { data: stillAvailable } = await supabase
-            .from('matchmaking_queue')
-            .select('id')
-            .eq('id', opponent.id)
-            .eq('status', 'searching')
-            .single();
+        // Vérifier que l'adversaire est toujours disponible
+        const { data: stillAvailable } = await supabase
+          .from('matchmaking_queue')
+          .select('id')
+          .eq('id', opponent.id)
+          .eq('status', 'searching')
+          .single();
 
-          if (!stillAvailable) {
-            // L'adversaire n'est plus disponible, ajouter à la file
-            return await addToQueue(gameMode, deckId, userLevel);
-          }
-
-          // Créer la salle
-          const { data: room, error: roomError } = await supabase
-            .from('game_rooms')
-            .insert({
-              name: `Match ${gameMode}`,
-              host_id: user.id,
-              game_mode: gameMode,
-              status: 'waiting',
-              max_players: 2,
-              current_players: 2,
-              allow_spectators: true,
-              min_level: Math.min(userLevel, opponent.profile.level),
-              max_level: Math.max(userLevel, opponent.profile.level)
-            })
-            .select()
-            .single();
-
-          if (roomError) throw roomError;
-
-          // Ajouter les deux joueurs à la salle
-          const { error: participant1Error } = await supabase
-            .from('room_participants')
-            .insert({
-              room_id: room.id,
-              user_id: user.id,
-              role: 'player',
-              player_number: 1,
-              deck_id: deckId,
-              status: 'connected'
-            });
-
-          if (participant1Error) throw participant1Error;
-
-          const { error: participant2Error } = await supabase
-            .from('room_participants')
-            .insert({
-              room_id: room.id,
-              user_id: opponent.user_id,
-              role: 'player',
-              player_number: 2,
-              deck_id: opponent.deck_id,
-              status: 'connected'
-            });
-
-          if (participant2Error) throw participant2Error;
-
-          // Supprimer les entrées de file d'attente
-          await supabase
-            .from('matchmaking_queue')
-            .delete()
-            .in('user_id', [user.id, opponent.user_id]);
-
-          return { 
-            status: 'match_found', 
-            room_id: room.id,
-            opponent: {
-              username: opponent.profile.username,
-              level: opponent.profile.level
-            }
-          };
-        } catch (error) {
-          console.error('Erreur création salle:', error);
-          // En cas d'erreur, ajouter à la file
+        if (!stillAvailable) {
+          console.log('Adversaire plus disponible, ajout à la file');
           return await addToQueue(gameMode, deckId, userLevel);
         }
+
+        console.log('Création de salle avec adversaire:', opponent.profile.username);
+
+        // Créer la salle
+        const { data: room, error: roomError } = await supabase
+          .from('game_rooms')
+          .insert({
+            name: `Match ${gameMode}`,
+            host_id: user.id,
+            game_mode: gameMode,
+            status: 'waiting',
+            max_players: 2,
+            current_players: 2,
+            allow_spectators: true,
+            min_level: Math.min(userLevel, opponent.profile.level),
+            max_level: Math.max(userLevel, opponent.profile.level)
+          })
+          .select()
+          .single();
+
+        if (roomError) throw roomError;
+
+        // Ajouter les deux joueurs à la salle
+        const { error: participant1Error } = await supabase
+          .from('room_participants')
+          .insert({
+            room_id: room.id,
+            user_id: user.id,
+            role: 'player',
+            player_number: 1,
+            deck_id: deckId,
+            status: 'connected'
+          });
+
+        if (participant1Error) throw participant1Error;
+
+        const { error: participant2Error } = await supabase
+          .from('room_participants')
+          .insert({
+            room_id: room.id,
+            user_id: opponent.user_id,
+            role: 'player',
+            player_number: 2,
+            deck_id: opponent.deck_id,
+            status: 'connected'
+          });
+
+        if (participant2Error) throw participant2Error;
+
+        // Supprimer les entrées de file d'attente
+        await supabase
+          .from('matchmaking_queue')
+          .delete()
+          .in('user_id', [user.id, opponent.user_id]);
+
+        return { 
+          status: 'match_found', 
+          room_id: room.id,
+          opponent: {
+            username: opponent.profile.username,
+            level: opponent.profile.level
+          }
+        };
       } else {
-        // Aucun adversaire trouvé, ajouter à la file d'attente
+        console.log('Aucun adversaire trouvé, ajout à la file');
         return await addToQueue(gameMode, deckId, userLevel);
       }
     } catch (error) {
-      console.error('Erreur find_match:', error);
+      console.error('Erreur find_match fallback:', error);
       throw error;
     }
   };
@@ -159,6 +240,8 @@ export const useMatchmaking = (user: any) => {
   const addToQueue = async (gameMode: string, deckId: number, userLevel: number) => {
     const levelMin = Math.max(1, userLevel - 5);
     const levelMax = userLevel + 5;
+
+    console.log('Ajout à la file d\'attente...');
 
     const { data: queueEntry, error: queueError } = await supabase
       .from('matchmaking_queue')
@@ -210,6 +293,8 @@ export const useMatchmaking = (user: any) => {
   // Démarrer la recherche
   const startSearch = useCallback(async (gameMode: string, deckId: number, userLevel: number) => {
     try {
+      console.log('Démarrage de la recherche de match...');
+      
       setState(prev => ({ 
         ...prev, 
         isSearching: true, 
@@ -219,9 +304,18 @@ export const useMatchmaking = (user: any) => {
         selectedDeckId: deckId
       }));
 
-      const result = await findMatchDirect(gameMode, deckId, userLevel);
+      // Vérifier d'abord s'il y a une salle existante
+      const hasExistingRoom = await checkExistingRoom();
+      if (hasExistingRoom) {
+        console.log('Salle existante trouvée, arrêt de la recherche');
+        return;
+      }
+
+      // Essayer de trouver un match
+      const result = await findMatchWithFunction(gameMode, deckId, userLevel);
 
       if (result.status === 'match_found') {
+        console.log('Match trouvé immédiatement:', result);
         setState(prev => ({
           ...prev,
           status: 'match_found',
@@ -230,6 +324,7 @@ export const useMatchmaking = (user: any) => {
           isSearching: false
         }));
       } else if (result.status === 'searching') {
+        console.log('Ajouté à la file d\'attente, démarrage de l\'écoute...');
         // Démarrer l'écoute en temps réel pour les nouveaux adversaires
         startRealtimeListening(gameMode, deckId, userLevel);
       }
@@ -246,6 +341,8 @@ export const useMatchmaking = (user: any) => {
 
   // Écoute en temps réel pour les nouveaux adversaires
   const startRealtimeListening = (gameMode: string, deckId: number, userLevel: number) => {
+    console.log('Démarrage de l\'écoute en temps réel...');
+    
     // Arrêter l'ancienne subscription
     if (subscription) {
       subscription.unsubscribe();
@@ -262,19 +359,22 @@ export const useMatchmaking = (user: any) => {
       }, async (payload) => {
         const newEntry = payload.new;
         
+        console.log('Nouvelle entrée dans la file:', newEntry);
+        
         // Vérifier si c'est un adversaire compatible
         if (newEntry.user_id !== user.id && 
             newEntry.status === 'searching' &&
             newEntry.preferred_level_min <= userLevel + 5 &&
             newEntry.preferred_level_max >= userLevel - 5) {
           
-          console.log('Adversaire potentiel trouvé:', newEntry);
+          console.log('Adversaire potentiel trouvé, tentative de match...');
           
           // Attendre un peu pour éviter les conditions de course
           setTimeout(async () => {
             try {
-              const result = await findMatchDirect(gameMode, deckId, userLevel);
+              const result = await findMatchWithFunction(gameMode, deckId, userLevel);
               if (result.status === 'match_found') {
+                console.log('Match créé via écoute temps réel:', result);
                 setState(prev => ({
                   ...prev,
                   status: 'match_found',
@@ -303,8 +403,10 @@ export const useMatchmaking = (user: any) => {
     // Démarrer aussi un polling de sécurité moins fréquent
     const interval = setInterval(async () => {
       try {
-        const result = await findMatchDirect(gameMode, deckId, userLevel);
+        console.log('Vérification périodique de match...');
+        const result = await findMatchWithFunction(gameMode, deckId, userLevel);
         if (result.status === 'match_found') {
+          console.log('Match trouvé via polling:', result);
           setState(prev => ({
             ...prev,
             status: 'match_found',
@@ -319,7 +421,7 @@ export const useMatchmaking = (user: any) => {
       } catch (error) {
         console.error('Erreur polling:', error);
       }
-    }, 5000); // Vérifier toutes les 5 secondes
+    }, 10000); // Vérifier toutes les 10 secondes
 
     setPollInterval(interval);
   };
@@ -327,6 +429,8 @@ export const useMatchmaking = (user: any) => {
   // Annuler la recherche
   const cancelSearch = useCallback(async () => {
     try {
+      console.log('Annulation de la recherche...');
+      
       if (pollInterval) {
         clearInterval(pollInterval);
         setPollInterval(null);

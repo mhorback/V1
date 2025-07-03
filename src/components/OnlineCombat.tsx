@@ -24,11 +24,55 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
   // Hook de matchmaking
   const matchmaking = useMatchmaking(user);
 
+  // Vérifier s'il y a une salle existante au chargement
+  const checkExistingRoom = useCallback(async () => {
+    try {
+      const { data: existingParticipation } = await supabase
+        .from('room_participants')
+        .select(`
+          room_id,
+          status,
+          room:game_rooms!room_participants_room_id_fkey(*)
+        `)
+        .eq('user_id', user.id)
+        .in('room.status', ['waiting', 'starting', 'in_progress'])
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (existingParticipation && existingParticipation.length > 0) {
+        const room = existingParticipation[0].room;
+        console.log('Salle existante trouvée:', room);
+        
+        setCurrentRoom(room);
+        setIsReady(existingParticipation[0].status === 'ready');
+        
+        if (room.status === 'in_progress') {
+          setCurrentView('game');
+        } else {
+          setCurrentView('room');
+        }
+        
+        return true;
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Erreur vérification salle existante:', error);
+      return false;
+    }
+  }, [user.id]);
+
   // Entrer en file d'attente
   const enterMatchmaking = async () => {
     if (!selectedDeck) {
       setError('Veuillez sélectionner un deck');
       return;
+    }
+
+    // Vérifier d'abord s'il y a une salle existante
+    const hasExistingRoom = await checkExistingRoom();
+    if (hasExistingRoom) {
+      return; // La vue sera changée automatiquement
     }
 
     try {
@@ -60,7 +104,6 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
       // Filtrer les participants avec des profils valides
       const validParticipants = (data || []).map(participant => {
         if (!participant.profile) {
-          // Si le profil n'est pas chargé, essayer de le récupérer directement
           console.warn('Profil manquant pour participant:', participant.user_id);
           return {
             ...participant,
@@ -74,10 +117,16 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
       });
 
       setRoomParticipants(validParticipants);
+      
+      // Mettre à jour le statut prêt de l'utilisateur actuel
+      const currentUserParticipant = validParticipants.find(p => p.user_id === user.id);
+      if (currentUserParticipant) {
+        setIsReady(currentUserParticipant.status === 'ready');
+      }
     } catch (err) {
       console.error('Erreur participants:', err);
     }
-  }, []);
+  }, [user.id]);
 
   // Formatage du temps
   const formatTime = (seconds: number) => {
@@ -170,13 +219,43 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
     }
   };
 
+  // Quitter la salle
+  const leaveRoom = async () => {
+    if (!currentRoom) return;
+
+    try {
+      // Supprimer le participant
+      const { error: deleteError } = await supabase
+        .from('room_participants')
+        .delete()
+        .eq('room_id', currentRoom.id)
+        .eq('user_id', user.id);
+
+      if (deleteError) throw deleteError;
+
+      // Si c'est l'hôte et que la salle n'a pas commencé, supprimer la salle
+      if (currentRoom.host_id === user.id && currentRoom.status === 'waiting') {
+        await supabase
+          .from('game_rooms')
+          .update({ status: 'cancelled' })
+          .eq('id', currentRoom.id);
+      }
+
+      // Retourner au menu
+      setCurrentRoom(null);
+      setIsReady(false);
+      setGameStartCountdown(0);
+      setCurrentView('menu');
+    } catch (err) {
+      console.error('Erreur quitter salle:', err);
+      setError('Impossible de quitter la salle');
+    }
+  };
+
   // Gérer les résultats du matchmaking
   useEffect(() => {
     if (matchmaking.status === 'match_found' && matchmaking.roomId) {
       console.log('Match trouvé, redirection vers la salle:', matchmaking.roomId);
-      
-      // Arrêter le matchmaking
-      matchmaking.cancelSearch();
       
       // Rediriger vers la salle trouvée
       setCurrentView('room');
@@ -211,7 +290,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
       // Recharger périodiquement pour s'assurer d'avoir les dernières données
       const interval = setInterval(() => {
         loadRoomParticipants(currentRoom.id);
-      }, 2000);
+      }, 3000);
       
       return () => clearInterval(interval);
     }
@@ -252,6 +331,13 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
         if (updatedRoom.status === 'in_progress') {
           setCurrentView('game');
         }
+        
+        // Si la salle a été annulée, retourner au menu
+        if (updatedRoom.status === 'cancelled') {
+          setCurrentRoom(null);
+          setCurrentView('menu');
+          setError('La salle a été fermée');
+        }
       })
       .subscribe();
 
@@ -260,6 +346,11 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
       roomSubscription.unsubscribe();
     };
   }, [currentRoom, loadRoomParticipants]);
+
+  // Vérifier les salles existantes au chargement
+  useEffect(() => {
+    checkExistingRoom();
+  }, [checkExistingRoom]);
 
   // Gérer la fin de partie
   const handleGameEnd = (winner: string) => {
@@ -390,6 +481,11 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
               <div className="animate-spin w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full mx-auto mb-6"></div>
               <h2 className="text-2xl font-bold text-white mb-4">🔍 Recherche d'adversaire</h2>
               <p className="text-gray-300 mb-6">Temps d'attente: {formatTime(matchmaking.queueTime)}</p>
+              <div className="bg-slate-700 rounded-lg p-4 mb-4">
+                <p className="text-gray-400 text-sm">
+                  Recherche d'un joueur de niveau {Math.max(1, user.level - 5)} à {user.level + 5}
+                </p>
+              </div>
             </>
           )}
 
@@ -424,10 +520,6 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
               <p className="text-white font-bold">Deck sélectionné:</p>
               <p className="text-gray-300">{selectedDeck?.name}</p>
             </div>
-            <div className="bg-slate-700 rounded-lg p-4">
-              <p className="text-white font-bold">Niveau recherché:</p>
-              <p className="text-gray-300">{Math.max(1, user.level - 5)} - {user.level + 5}</p>
-            </div>
             
             {matchmaking.status !== 'match_found' && (
               <button
@@ -459,7 +551,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
           <div className="flex justify-between items-center mb-6">
             <h1 className="text-3xl font-bold text-white">🎮 Salle de Combat</h1>
             <button
-              onClick={() => setCurrentView('menu')}
+              onClick={leaveRoom}
               className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg font-bold transition-colors"
             >
               Quitter
@@ -498,6 +590,7 @@ const OnlineCombat: React.FC<OnlineCombatProps> = ({ user, userDecks, onBack }) 
                           <div>
                             <p className="text-white font-bold">
                               {player.profile?.username || 'Chargement...'}
+                              {player.user_id === user.id && ' (Vous)'}
                             </p>
                             <p className="text-gray-300 text-sm">
                               Niveau {player.profile?.level || 'N/A'}
