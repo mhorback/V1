@@ -1,7 +1,6 @@
 import { GameState } from '../types/game';
 import { useGameStore } from '../stores/gameStore';
 import { socketManager } from './socketManager';
-import { createHash } from 'crypto';
 
 export class StateSync {
   private static readonly SYNC_INTERVAL = 10000; // 10 secondes
@@ -79,19 +78,22 @@ export class StateSync {
       last_action_timestamp: gameState.last_action_timestamp
     };
 
-    // Utiliser une fonction de hash simple (en production, utiliser crypto)
-    return this.simpleHash(JSON.stringify(normalizedState));
+    // Utiliser une fonction de hash compatible navigateur
+    return this.browserCompatibleHash(JSON.stringify(normalizedState));
   }
 
-  // Fonction de hash simple (remplacer par crypto en production)
-  private static simpleHash(str: string): string {
+  // Fonction de hash compatible navigateur
+  private static browserCompatibleHash(str: string): string {
     let hash = 0;
+    if (str.length === 0) return hash.toString(36);
+    
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
       hash = ((hash << 5) - hash) + char;
       hash = hash & hash; // Convertir en 32bit integer
     }
-    return hash.toString(36);
+    
+    return Math.abs(hash).toString(36);
   }
 
   // Envoyer un ping de synchronisation
