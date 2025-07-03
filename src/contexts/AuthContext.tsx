@@ -32,14 +32,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setSession(session);
       setUser(session?.user ?? null);
       setLoading(false);
+    }).catch(error => {
+      // Ignorer les erreurs de session au démarrage
+      console.warn('Erreur session initiale ignorée:', error);
+      setSession(null);
+      setUser(null);
+      setLoading(false);
     });
 
     // Listen for auth changes
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (event, session) => {
-      setSession(session);
-      setUser(session?.user ?? null);
+      console.log('Auth state change:', event);
+      
+      // Gérer les événements d'authentification
+      if (event === 'SIGNED_OUT' || event === 'TOKEN_REFRESHED') {
+        setSession(session);
+        setUser(session?.user ?? null);
+      } else if (event === 'SIGNED_IN') {
+        setSession(session);
+        setUser(session?.user ?? null);
+      } else {
+        // Pour les autres événements, mettre à jour normalement
+        setSession(session);
+        setUser(session?.user ?? null);
+      }
       setLoading(false);
     });
 
@@ -47,76 +65,66 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const signIn = async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-    return { error };
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      return { error };
+    } catch (error) {
+      console.warn('Erreur signIn:', error);
+      return { error };
+    }
   };
 
   const signUp = async (email: string, password: string, username: string) => {
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          username,
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            username,
+          },
         },
-      },
-    });
+      });
 
-    if (!error && data.user) {
-      // Create profile
-      const { error: profileError } = await supabase
-        .from('profiles')
-        .insert({
-          id: data.user.id,
-          username,
-        });
+      if (!error && data.user) {
+        // Create profile
+        const { error: profileError } = await supabase
+          .from('profiles')
+          .insert({
+            id: data.user.id,
+            username,
+          });
 
-      if (profileError) {
-        return { error: profileError };
+        if (profileError) {
+          return { error: profileError };
+        }
       }
-    }
 
-    return { error };
+      return { error };
+    } catch (error) {
+      console.warn('Erreur signUp:', error);
+      return { error };
+    }
   };
 
   const signOut = async () => {
     try {
-      // Check if there's an active session before attempting to sign out
-      const { data: { session } } = await supabase.auth.getSession();
-      
-      if (session) {
-        // Check if the session is locally expired
-        const now = Math.floor(Date.now() / 1000);
-        const sessionExpiresAt = session.expires_at;
-        
-        // If session is not expired locally, attempt server-side logout
-        if (sessionExpiresAt && now < sessionExpiresAt) {
-          const { error } = await supabase.auth.signOut();
-          
-          if (error) {
-            // Log session_not_found errors as warnings since they're expected when session is already invalid
-            if (error.message?.includes('session_not_found') || error.message?.includes('Session from session_id claim in JWT does not exist')) {
-              console.warn('Session already invalid on server, clearing local state:', error.message);
-            } else {
-              // Log other errors normally
-              console.warn('Sign out request failed, but clearing local session state:', error);
-            }
-          }
-        } else {
-          // Session is locally expired, skip server request
-          console.log('Session locally expired, skipping server logout request');
-        }
-      }
-    } catch (error) {
-      // If signOut fails (e.g., session already invalid), we still want to clear local state
-      console.warn('Sign out request failed, but clearing local session state:', error);
-    } finally {
-      // Always clear the local state regardless of server response
+      // Nettoyer immédiatement l'état local
       setSession(null);
       setUser(null);
+      
+      // Essayer de se déconnecter du serveur, mais ne pas attendre
+      supabase.auth.signOut().catch(error => {
+        // Ignorer silencieusement les erreurs de déconnexion
+        console.warn('Erreur déconnexion serveur ignorée:', error);
+      });
+      
+    } catch (error) {
+      // Ignorer toutes les erreurs de déconnexion
+      console.warn('Erreur signOut ignorée:', error);
     }
   };
 
